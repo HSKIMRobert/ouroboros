@@ -338,11 +338,13 @@ class AutoPipelineState:
     # ``REQUIRED_SECTIONS`` at construction time by the MCP handler — only
     # known section keys with non-empty string values land here.
     user_preferences: dict[str, str] = field(default_factory=dict)
-    # Active domain profile name resolved at session start (PR-3, #809 P3).
+    # Active domain profile name resolved at session start (#809 P3).
     # The DomainProfile instance itself is not stored here because it contains
     # callables that are not JSON-serializable. Downstream phases recover the
-    # profile via ``DEFAULT_REGISTRY.get(active_domain_profile_name)``.
-    # None means no profile was activated (current baked-in behavior persists).
+    # profile via ``DEFAULT_REGISTRY.get(active_domain_profile_name)`` and
+    # prefer the profile's ``safe_defaults`` over the hardcoded coding-domain
+    # fallback. None means no profile was activated, so legacy state files load
+    # unchanged.
     active_domain_profile_name: str | None = None
     # QA verdict captured during the EVALUATE phase (RFC #809 Phase 2.1).
     # Persisted so a resumed session reuses the verdict without re-invoking
