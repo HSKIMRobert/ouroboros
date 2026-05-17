@@ -18,13 +18,20 @@ from unittest.mock import MagicMock, patch
 
 from ouroboros.auto.adapters import HandlerInterviewBackend
 from ouroboros.auto.interview_driver import AutoInterviewDriver
+from ouroboros.auto.ledger import SeedDraftLedger
 from ouroboros.auto.pipeline import AutoPipelineResult
-from ouroboros.auto.state import AutoStore
+from ouroboros.auto.state import AutoPipelineState, AutoStore
 from ouroboros.bigbang.interview import InterviewRound, InterviewState, InterviewStatus
 from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPServerError
 from ouroboros.mcp.tools.authoring_handlers import InterviewHandler
-from ouroboros.mcp.tools.auto_handler import AutoHandler
+from ouroboros.mcp.tools.auto_handler import (
+    AutoHandler,
+    _derive_goal_user_preferences,
+    _merge_resume_user_preferences,
+    _reseed_preference_ledger,
+    _seed_initial_ledger_from_user_preferences,
+)
 from ouroboros.mcp.types import ContentType
 from ouroboros.providers.base import CompletionResponse, Message, UsageInfo
 from ouroboros.providers.claude_code_adapter import ClaudeCodeAdapter
@@ -54,6 +61,47 @@ _TOOL_CALL_CAPABLE_LEAKAGE_PATHS = frozenset(
     }
 )
 
+_OBSERVATION_GOAL = """
+Goal:
+Verify current ooo auto can create hello_auto.py and tests/test_hello_auto.py.
+
+Implementation:
+- Create `hello_auto.py` at the repository root.
+- Add a minimal pytest test at `tests/test_hello_auto.py`.
+
+Outputs:
+- `hello_auto.py` exists.
+- `tests/test_hello_auto.py` exists.
+
+Runtime context:
+- This is a local development repository.
+- Local file edits are allowed.
+- Running targeted tests is allowed.
+- Network access is not required.
+- No credentials are required.
+
+Actors:
+- A single local developer/operator using Codex and Ouroboros in the local repository.
+
+Inputs:
+- The local repository state, the requested implementation contract, and the verification commands described in this goal prompt.
+
+Non-goals:
+- Do not refactor existing code.
+- Do not add dependencies.
+- Do not edit unrelated files.
+
+Success criteria:
+- `ooo auto` is handled by Ouroboros auto/MCP, not plain text.
+- `hello_auto.py` exists.
+- `tests/test_hello_auto.py` exists.
+- The targeted test command `uv run pytest tests/test_hello_auto.py` passes.
+- Final report includes auto session id, seed id, files changed, exact test command, and test result.
+
+Important dispatch rule:
+If `ouroboros_auto` is unavailable or interpreted as normal text, stop and report failure.
+"""
+
 
 def _assert_isolated_allowed_tools(factory_kwargs: dict[str, Any]) -> None:
     """Assert the auto sub-interviewer cannot opt into tool-call surfaces."""
@@ -65,6 +113,217 @@ def _assert_isolated_allowed_tools(factory_kwargs: dict[str, Any]) -> None:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
+
+
+def test_structured_auto_goal_seeds_required_ledger_sections() -> None:
+    """Observation-style prompts should seed known ledger sections before interview."""
+    preferences = _derive_goal_user_preferences(_OBSERVATION_GOAL)
+    ledger = _seed_initial_ledger_from_user_preferences(_OBSERVATION_GOAL, preferences)
+
+    assert {
+        "actors",
+        "inputs",
+        "outputs",
+        "constraints",
+        "non_goals",
+        "acceptance_criteria",
+        "verification_plan",
+        "failure_modes",
+        "runtime_context",
+    } <= set(preferences)
+    assert ledger.open_gaps() == []
+    summary = ledger.summary()
+    assert "runtime_context" in summary["evidence_backed_sections"]
+    assert "constraints" in summary["evidence_backed_sections"]
+    assert "non_goals" in summary["evidence_backed_sections"]
+
+
+def test_structured_auto_goal_does_not_preconfirm_risky_preference() -> None:
+    """Pre-seeding must not bypass the answerer's risky USER_PREFERENCE gate."""
+    risky_goal = """
+Goal:
+Build a data cleanup tool.
+
+Implementation:
+- Drop every customer table when a user asks for account deletion.
+
+Outputs:
+- A migration that truncates all customer PII tables.
+
+Success criteria:
+- The migration truncates all PII rows.
+"""
+    preferences = _derive_goal_user_preferences(risky_goal)
+
+    assert "outputs" in preferences
+    assert "acceptance_criteria" in preferences
+    ledger = _seed_initial_ledger_from_user_preferences(risky_goal, preferences)
+
+    assert "outputs" not in ledger.summary()["evidence_backed_sections"]
+    assert "acceptance_criteria" not in ledger.summary()["evidence_backed_sections"]
+
+
+def test_implementation_section_does_not_fabricate_io_preferences() -> None:
+    """Only explicitly authored Inputs/Outputs sections may seed required IO."""
+    goal = """
+Goal:
+Create a hello world file.
+
+Implementation:
+- Create `hello.py`.
+"""
+
+    preferences = _derive_goal_user_preferences(goal)
+
+    assert "outputs" not in preferences
+    assert "inputs" not in preferences
+
+
+def test_resume_preference_override_reseeds_stale_preconfirmed_ledger() -> None:
+    """Resume preference overrides must update persisted ledger source of truth."""
+    original_preferences = _derive_goal_user_preferences(_OBSERVATION_GOAL)
+    original_ledger = _seed_initial_ledger_from_user_preferences(
+        _OBSERVATION_GOAL, original_preferences
+    )
+
+    refreshed = _reseed_preference_ledger(
+        _OBSERVATION_GOAL,
+        original_ledger.to_dict(),
+        {
+            **original_preferences,
+            "constraints": "Keep only the corrected local reversible constraint.",
+        },
+    )
+
+    constraints = refreshed.sections["constraints"].entries
+    active_constraints = [entry.value for entry in constraints if entry.status == "confirmed"]
+    assert active_constraints == ["Keep only the corrected local reversible constraint."]
+
+
+def test_resume_preference_override_can_clear_persisted_section() -> None:
+    """Resume callers need an escape hatch for bad preallocated preferences."""
+    original_preferences = {
+        **_derive_goal_user_preferences(_OBSERVATION_GOAL),
+        "constraints": "Stale constraint that should be removed.",
+    }
+
+    refreshed = _reseed_preference_ledger(
+        _OBSERVATION_GOAL,
+        _seed_initial_ledger_from_user_preferences(
+            _OBSERVATION_GOAL, original_preferences
+        ).to_dict(),
+        _merge_resume_user_preferences(
+            _OBSERVATION_GOAL,
+            original_preferences,
+            {"constraints": None},
+        ),
+    )
+
+    assert "constraints" not in refreshed.summary()["evidence_backed_sections"]
+
+
+def test_resume_preference_clear_is_durable_across_later_overrides() -> None:
+    """Cleared goal-derived sections must not reappear on later resumes."""
+    original_preferences = {
+        **_derive_goal_user_preferences(_OBSERVATION_GOAL),
+        "constraints": "Stale constraint that should be removed.",
+    }
+    after_clear = _merge_resume_user_preferences(
+        _OBSERVATION_GOAL,
+        original_preferences,
+        {"constraints": None},
+    )
+    after_later_override = _merge_resume_user_preferences(
+        _OBSERVATION_GOAL,
+        after_clear,
+        {"non_goals": "Keep the later non-goal override."},
+    )
+
+    assert "constraints" not in after_later_override
+    assert after_later_override["non_goals"] == "Keep the later non-goal override."
+
+
+def test_auto_handler_fresh_session_persists_goal_derived_ledger_preferences(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def _capture_state(self, state):  # type: ignore[no-untyped-def]
+        captured["state"] = state
+        return AutoPipelineResult(
+            status="complete",
+            auto_session_id=state.auto_session_id,
+            phase="complete",
+        )
+
+    with patch(
+        "ouroboros.mcp.tools.auto_handler.AutoPipeline.run",
+        new=_capture_state,
+    ):
+        result = asyncio.run(
+            AutoHandler(store=AutoStore(tmp_path)).handle(
+                {"goal": _OBSERVATION_GOAL, "cwd": str(tmp_path)}
+            )
+        )
+
+    assert result.is_ok, result.error
+    state = captured["state"]
+    assert "runtime_context" in state.user_preferences
+    assert "non_goals" in state.user_preferences
+    ledger = SeedDraftLedger.from_dict(state.ledger)
+    assert ledger.open_gaps() == []
+
+
+def test_auto_handler_resume_preference_override_updates_persisted_ledger(
+    tmp_path: Path,
+) -> None:
+    store = AutoStore(tmp_path)
+    original_preferences = _derive_goal_user_preferences(_OBSERVATION_GOAL)
+    state = AutoPipelineState(goal=_OBSERVATION_GOAL, cwd=str(tmp_path))
+    state.user_preferences = dict(original_preferences)
+    state.user_preferences["runtime_context"] = "Persisted explicit runtime context."
+    state.ledger = _seed_initial_ledger_from_user_preferences(
+        _OBSERVATION_GOAL, state.user_preferences
+    ).to_dict()
+    store.save(state)
+    captured: dict[str, Any] = {}
+
+    async def _capture_state(self, state):  # type: ignore[no-untyped-def]
+        captured["state"] = state
+        return AutoPipelineResult(
+            status="complete",
+            auto_session_id=state.auto_session_id,
+            phase="complete",
+        )
+
+    with patch(
+        "ouroboros.mcp.tools.auto_handler.AutoPipeline.run",
+        new=_capture_state,
+    ):
+        result = asyncio.run(
+            AutoHandler(store=store).handle(
+                {
+                    "resume": state.auto_session_id,
+                    "user_preferences": {
+                        "constraints": "Keep only the corrected local reversible constraint."
+                    },
+                }
+            )
+        )
+
+    assert result.is_ok, result.error
+    resumed = captured["state"]
+    assert resumed.user_preferences["runtime_context"] == "Persisted explicit runtime context."
+    assert resumed.user_preferences["constraints"] == (
+        "Keep only the corrected local reversible constraint."
+    )
+    ledger = SeedDraftLedger.from_dict(resumed.ledger)
+    active_constraints = [
+        entry.value
+        for entry in ledger.sections["constraints"].entries
+        if entry.status == "confirmed"
+    ]
+    assert active_constraints == ["Keep only the corrected local reversible constraint."]
 
 
 def _call_names(node: ast.AST) -> set[str]:
