@@ -1838,8 +1838,10 @@ class TestParallelACExecutor:
         assert evidence_event.data["verifier_passed"] is True
 
     @pytest.mark.asyncio
-    async def test_fat_harness_docs_only_ac_rejects_prior_test_id_bleed(self, tmp_path) -> None:
-        """Docs-only ACs may omit tests, but non-empty stale tests_passed is still checked."""
+    async def test_fat_harness_docs_only_ac_ignores_out_of_scope_test_id_bleed(
+        self, tmp_path
+    ) -> None:
+        """Docs-only ACs ignore extra tests_passed instead of failing required docs evidence."""
         readme = tmp_path / "README.md"
         readme.write_text("# String utils\n", encoding="utf-8")
 
@@ -1894,16 +1896,21 @@ class TestParallelACExecutor:
             start_time=datetime.now(UTC),
         )
 
-        assert result.success is False
-        assert result.error is not None
-        assert "tests_passed: test_slugify.py::test_slugify" in result.error
+        assert result.success is True
+        assert result.error is None
+        assert result.typed_evidence is not None
+        assert result.typed_evidence.data == {
+            "files_touched": ["README.md"],
+            "commands_run": ["grep -n slugify README.md"],
+        }
         evidence_event = next(
             event
             for event in appended_events
             if event.type == "execution.ac.typed_evidence.observed"
         )
         assert evidence_event.data["required_fields"] == ["files_touched", "commands_run"]
-        assert evidence_event.data["verifier_failure_class"] == "FABRICATION_SUSPECTED"
+        assert evidence_event.data["ignored_out_of_scope_evidence_fields"] == ["tests_passed"]
+        assert evidence_event.data["verifier_passed"] is True
 
     @pytest.mark.asyncio
     async def test_fat_harness_docs_only_ac_passes_consistent_profile_to_injected_verifier(
@@ -1913,15 +1920,18 @@ class TestParallelACExecutor:
         readme = tmp_path / "README.md"
         readme.write_text("# String utils\n", encoding="utf-8")
         verifier_profiles: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+        verifier_records: list[dict[str, object]] = []
 
         def _recording_verifier(**kwargs: object) -> VerifierVerdict:
             profile = kwargs["profile"]
+            record = kwargs["record"]
             verifier_profiles.append(
                 (
                     tuple(profile.evidence_schema.required),  # type: ignore[attr-defined]
                     tuple(profile.must_produce),  # type: ignore[attr-defined]
                 )
             )
+            verifier_records.append(dict(record.data))  # type: ignore[attr-defined]
             return VerifierVerdict(passed=True)
 
         event_store, appended_events = _make_replaying_event_store()
@@ -1930,7 +1940,8 @@ class TestParallelACExecutor:
                 "```json\n"
                 "{\n"
                 '  "files_touched": ["README.md"],\n'
-                '  "commands_run": ["grep -n slugify README.md"]\n'
+                '  "commands_run": ["grep -n slugify README.md"],\n'
+                '  "tests_passed": ["test_slugify.py::test_slugify"]\n'
                 "}\n"
                 "```",
                 native_session_id="codex-session-docs-only-injected-verifier",
@@ -1978,12 +1989,19 @@ class TestParallelACExecutor:
         assert result.success is True
         assert verifier_profiles == [(("files_touched", "commands_run"), ("files_touched",))]
         assert set(verifier_profiles[0][1]).issubset(verifier_profiles[0][0])
+        assert verifier_records == [
+            {
+                "files_touched": ["README.md"],
+                "commands_run": ["grep -n slugify README.md"],
+            }
+        ]
         evidence_event = next(
             event
             for event in appended_events
             if event.type == "execution.ac.typed_evidence.observed"
         )
         assert evidence_event.data["required_fields"] == ["files_touched", "commands_run"]
+        assert evidence_event.data["ignored_out_of_scope_evidence_fields"] == ["tests_passed"]
         assert evidence_event.data["verifier_passed"] is True
 
     @pytest.mark.asyncio

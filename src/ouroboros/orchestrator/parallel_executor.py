@@ -250,6 +250,37 @@ def _effective_evidence_schema_for_ac(
     return EvidenceSchema(required=required, rejected_if=rejected_if)
 
 
+def _out_of_scope_evidence_fields_for_ac(
+    profile: ExecutionProfile,
+    ac_content: str,
+    record: EvidenceRecord | None,
+) -> tuple[str, ...]:
+    """Return non-empty evidence fields excluded by the AC-specific schema."""
+    if record is None:
+        return ()
+    effective_schema = _effective_evidence_schema_for_ac(profile, ac_content)
+    required_fields = set(effective_schema.required)
+    return tuple(
+        field
+        for field in profile.evidence_schema.required
+        if field not in required_fields and _flatten_evidence_values(record.get(field))
+    )
+
+
+def _scoped_evidence_record_for_ac(
+    profile: ExecutionProfile,
+    ac_content: str,
+    record: EvidenceRecord,
+) -> EvidenceRecord:
+    """Return only evidence fields inside the AC-specific schema."""
+    effective_schema = _effective_evidence_schema_for_ac(profile, ac_content)
+    allowed_fields = set(effective_schema.required)
+    return EvidenceRecord(
+        data={field: value for field, value in record.data.items() if field in allowed_fields},
+        source=record.source,
+    )
+
+
 def _profile_with_evidence_schema(
     profile: ExecutionProfile,
     schema: EvidenceSchema,
@@ -4683,6 +4714,13 @@ Files present:
                 ),
             )
             clear_cached_runtime_handle = True
+            result_typed_evidence = typed_evidence
+            if success and self._execution_profile is not None and typed_evidence is not None:
+                result_typed_evidence = _scoped_evidence_record_for_ac(
+                    self._execution_profile,
+                    ac_content,
+                    typed_evidence,
+                )
 
             log.info(
                 "parallel_executor.ac.completed",
@@ -4704,7 +4742,7 @@ Files present:
                 retry_attempt=retry_attempt,
                 depth=depth,
                 runtime_handle=runtime_handle,
-                typed_evidence=typed_evidence,
+                typed_evidence=result_typed_evidence,
                 typed_evidence_validation=typed_validation,
                 typed_evidence_error=typed_error,
                 atomic_verifier_verdict=verifier_verdict,
@@ -4869,17 +4907,22 @@ Files present:
             effective_profile = _profile_with_evidence_schema(
                 self._execution_profile, effective_schema
             )
+            scoped_evidence = _scoped_evidence_record_for_ac(
+                self._execution_profile,
+                ac_content,
+                typed_evidence,
+            )
             verdict = (
                 verifier(
                     profile=effective_profile,
                     ac=ac_content,
                     leaf_output=final_message,
-                    record=typed_evidence,
+                    record=scoped_evidence,
                 )
                 if verifier is not None
                 else self._verify_atomic_evidence_against_runtime_messages(
                     messages=messages,
-                    typed_evidence=typed_evidence,
+                    typed_evidence=scoped_evidence,
                     ac_content=ac_content,
                 )
             )
@@ -4924,11 +4967,6 @@ Files present:
         effective_schema = _effective_evidence_schema_for_ac(self._execution_profile, ac_content)
         required_fields = set(effective_schema.required)
         fields_to_verify = list(effective_schema.required)
-        for field_name in self._execution_profile.evidence_schema.required:
-            if field_name not in required_fields and _flatten_evidence_values(
-                typed_evidence.get(field_name)
-            ):
-                fields_to_verify.append(field_name)
 
         for field_name in fields_to_verify:
             values = tuple(_flatten_evidence_values(typed_evidence.get(field_name)))
@@ -5018,6 +5056,13 @@ Files present:
             data["verifier_failure_class"] = verifier_verdict.failure_class
         if typed_evidence is not None:
             data["typed_evidence_fields"] = sorted(typed_evidence.data)
+            data["ignored_out_of_scope_evidence_fields"] = list(
+                _out_of_scope_evidence_fields_for_ac(
+                    self._execution_profile,
+                    ac_content,
+                    typed_evidence,
+                )
+            )
         if typed_validation is not None:
             data["missing_fields"] = list(typed_validation.missing_fields)
             data["rejected_by"] = list(typed_validation.rejected_by)
