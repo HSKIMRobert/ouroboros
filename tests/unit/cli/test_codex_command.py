@@ -8,12 +8,15 @@ import sys
 import textwrap
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
+from ouroboros.cli.commands import codex as codex_command
 from ouroboros.cli.commands.codex import (
     _MCP_PROTOCOL_VERSION,
     _check_auto_dispatch_surface,
     _list_stdio_mcp_tool_names,
+    _should_retry_stdio_mcp_framing,
     app,
 )
 from ouroboros.codex import CodexArtifactInstallResult, install_codex_artifacts
@@ -250,7 +253,7 @@ class TestCodexDoctor:
             {"OUROBOROS_AGENT_RUNTIME": "codex"},
         )
 
-    def test_list_stdio_mcp_tool_names_uses_protocol_without_local_mcp_import(
+    def test_list_stdio_mcp_tool_names_uses_jsonl_protocol_without_local_mcp_import(
         self,
         tmp_path: Path,
     ) -> None:
@@ -266,22 +269,14 @@ class TestCodexDoctor:
                 sys.stderr.buffer.flush()
 
                 def read_message():
-                    content_length = None
-                    while True:
-                        line = sys.stdin.buffer.readline()
-                        if not line:
-                            raise SystemExit(0)
-                        line = line.strip()
-                        if not line:
-                            break
-                        key, _, value = line.partition(b":")
-                        if key.lower() == b"content-length":
-                            content_length = int(value.strip())
-                    return json.loads(sys.stdin.buffer.read(content_length))
+                    line = sys.stdin.buffer.readline()
+                    if not line:
+                        raise SystemExit(0)
+                    return json.loads(line)
 
                 def write_message(message):
                     body = json.dumps(message).encode("utf-8")
-                    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
+                    sys.stdout.buffer.write(body + b"\n")
                     sys.stdout.buffer.flush()
 
                 initialize = read_message()
@@ -299,6 +294,11 @@ class TestCodexDoctor:
                     },
                 })
                 read_message()  # notifications/initialized
+                write_message({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/message",
+                    "params": {"level": "info", "data": "skip non-response messages"},
+                })
                 tools_list = read_message()
                 write_message({
                     "jsonrpc": "2.0",
@@ -322,6 +322,220 @@ class TestCodexDoctor:
         )
 
         assert tool_names >= _REQUIRED_CODEX_AUTO_TOOLS_FOR_TEST
+
+    def test_list_stdio_mcp_tool_names_preserves_content_length_fallback(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        server_path = tmp_path / "fake_header_mcp_server.py"
+        server_path.write_text(
+            textwrap.dedent(
+                r"""
+                import json
+                import sys
+
+                first_line = sys.stdin.buffer.readline()
+                if first_line and first_line.lstrip().startswith(b"{"):
+                    raise SystemExit(2)
+
+                def read_message():
+                    headers = {}
+                    line = first_line
+                    while True:
+                        if not line:
+                            raise SystemExit(0)
+                        stripped = line.strip()
+                        if not stripped:
+                            break
+                        name, value = stripped.decode("ascii").split(":", 1)
+                        headers[name.lower()] = value.strip()
+                        line = sys.stdin.buffer.readline()
+                    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+                def write_message(message):
+                    body = json.dumps(message).encode("utf-8")
+                    sys.stdout.buffer.write(
+                        f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+                    )
+                    sys.stdout.buffer.flush()
+
+                initialize = read_message()
+                write_message({
+                    "jsonrpc": "2.0",
+                    "id": initialize["id"],
+                    "result": {
+                        "protocolVersion": initialize["params"]["protocolVersion"],
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fake", "version": "1.0.0"},
+                    },
+                })
+                read_message()
+                tools_list = read_message()
+                write_message({
+                    "jsonrpc": "2.0",
+                    "id": tools_list["id"],
+                    "result": {
+                        "tools": [
+                            {"name": "ouroboros_auto", "inputSchema": {"type": "object"}},
+                            {"name": "ouroboros_start_auto", "inputSchema": {"type": "object"}},
+                            {"name": "ouroboros_interview", "inputSchema": {"type": "object"}},
+                            {"name": "ouroboros_generate_seed", "inputSchema": {"type": "object"}},
+                        ]
+                    },
+                })
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        tool_names = asyncio.run(
+            _list_stdio_mcp_tool_names(sys.executable, (str(server_path),), {})
+        )
+
+        assert tool_names >= _REQUIRED_CODEX_AUTO_TOOLS_FOR_TEST
+
+    def test_list_stdio_mcp_tool_names_retries_when_jsonl_initialize_send_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        server_path = tmp_path / "fake_header_mcp_server.py"
+        server_path.write_text(
+            textwrap.dedent(
+                r"""
+                import json
+                import sys
+
+                def read_message():
+                    headers = {}
+                    while True:
+                        line = sys.stdin.buffer.readline()
+                        if not line:
+                            raise SystemExit(0)
+                        stripped = line.strip()
+                        if not stripped:
+                            break
+                        name, value = stripped.decode("ascii").split(":", 1)
+                        headers[name.lower()] = value.strip()
+                    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+                def write_message(message):
+                    body = json.dumps(message).encode("utf-8")
+                    sys.stdout.buffer.write(
+                        f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+                    )
+                    sys.stdout.buffer.flush()
+
+                initialize = read_message()
+                write_message({
+                    "jsonrpc": "2.0",
+                    "id": initialize["id"],
+                    "result": {
+                        "protocolVersion": initialize["params"]["protocolVersion"],
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fake", "version": "1.0.0"},
+                    },
+                })
+                read_message()
+                tools_list = read_message()
+                write_message({
+                    "jsonrpc": "2.0",
+                    "id": tools_list["id"],
+                    "result": {
+                        "tools": [
+                            {"name": "ouroboros_auto", "inputSchema": {"type": "object"}},
+                            {"name": "ouroboros_start_auto", "inputSchema": {"type": "object"}},
+                            {"name": "ouroboros_interview", "inputSchema": {"type": "object"}},
+                            {"name": "ouroboros_generate_seed", "inputSchema": {"type": "object"}},
+                        ]
+                    },
+                })
+                """
+            ),
+            encoding="utf-8",
+        )
+        original_send = codex_command._send_stdio_mcp_message
+
+        async def fail_jsonl_initialize_send(proc, message, *, framing):
+            if framing == "jsonl" and message.get("method") == "initialize":
+                raise BrokenPipeError("pipe closed during JSONL initialize write")
+            await original_send(proc, message, framing=framing)
+
+        with patch(
+            "ouroboros.cli.commands.codex._send_stdio_mcp_message",
+            side_effect=fail_jsonl_initialize_send,
+        ):
+            tool_names = asyncio.run(
+                _list_stdio_mcp_tool_names(sys.executable, (str(server_path),), {})
+            )
+
+        assert tool_names >= _REQUIRED_CODEX_AUTO_TOOLS_FOR_TEST
+
+    def test_list_stdio_mcp_tool_names_surfaces_json_rpc_errors_without_framing_retry(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        server_path = tmp_path / "fake_error_mcp_server.py"
+        server_path.write_text(
+            textwrap.dedent(
+                r"""
+                import json
+                import sys
+
+                initialize = json.loads(sys.stdin.buffer.readline())
+                sys.stdout.buffer.write(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": initialize["id"],
+                    "error": {"code": -32000, "message": "initialize rejected"},
+                }).encode("utf-8") + b"\n")
+                sys.stdout.buffer.flush()
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(RuntimeError, match="initialize rejected"):
+            asyncio.run(_list_stdio_mcp_tool_names(sys.executable, (str(server_path),), {}))
+
+    def test_stdio_mcp_framing_retry_policy_distinguishes_probe_failures(self) -> None:
+        assert _should_retry_stdio_mcp_framing(TimeoutError("timed out waiting"))
+        assert _should_retry_stdio_mcp_framing(BrokenPipeError("pipe closed"))
+        assert _should_retry_stdio_mcp_framing(
+            RuntimeError("MCP stdio process exited before response")
+        )
+        assert not _should_retry_stdio_mcp_framing(RuntimeError("initialize rejected"))
+
+    def test_list_stdio_mcp_tool_names_does_not_retry_after_initialize_response(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        server_path = tmp_path / "fake_post_initialize_exit_mcp_server.py"
+        server_path.write_text(
+            textwrap.dedent(
+                r"""
+                import json
+                import sys
+
+                initialize = json.loads(sys.stdin.buffer.readline())
+                sys.stdout.buffer.write(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": initialize["id"],
+                    "result": {
+                        "protocolVersion": initialize["params"]["protocolVersion"],
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fake", "version": "1.0.0"},
+                    },
+                }).encode("utf-8") + b"\n")
+                sys.stdout.buffer.flush()
+                sys.stdin.buffer.readline()  # notifications/initialized
+                sys.stdin.buffer.readline()  # tools/list
+                raise SystemExit(3)
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(RuntimeError, match="exited before response"):
+            asyncio.run(_list_stdio_mcp_tool_names(sys.executable, (str(server_path),), {}))
 
     def test_check_auto_dispatch_surface_live_mcp_accepts_uvx_mcp_extra_without_local_mcp(
         self,
