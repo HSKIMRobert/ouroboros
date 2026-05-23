@@ -35,6 +35,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
+import os
 from pathlib import Path
 import re
 import shlex
@@ -563,6 +564,22 @@ def invoke_plugin(
         # crash on an unexpected runner return shape.
         return b""
 
+    def _plugin_runtime_env() -> dict[str, str]:
+        env = dict(os.environ)
+        # Installed plugin homes are immutable trust subjects. Prevent Python
+        # entrypoints from creating __pycache__ in plugin_home and provide a
+        # stable workspace/output contract for runtime artifacts.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        workdir = Path.cwd()
+        env.setdefault("OUROBOROS_PLUGIN_WORKDIR", str(workdir))
+        env.setdefault(
+            "OUROBOROS_PLUGIN_OUTPUT_DIR",
+            str(workdir / ".ouroboros" / "plugin-artifacts" / manifest.name),
+        )
+        if plugin_home is not None:
+            env.setdefault("OUROBOROS_PLUGIN_HOME", str(plugin_home))
+        return env
+
     def _run_lifecycle_hooks(hook_kind: HookKind) -> tuple[bool, str]:
         for hook in _matching_hooks(manifest, hook_kind):
             hook_provenance = {
@@ -601,6 +618,7 @@ def invoke_plugin(
                         check=False,
                         timeout=_hook_timeout_seconds(hook),
                         cwd=str(plugin_home) if plugin_home is not None else None,
+                        env=_plugin_runtime_env(),
                     )
                     hook_stdout = _to_bytes(hook_completed.stdout)
                     hook_stderr = _to_bytes(hook_completed.stderr)
@@ -1037,6 +1055,7 @@ def invoke_plugin(
         "capture_output": True,
         "check": False,
         "timeout": DEFAULT_PLUGIN_INVOCATION_TIMEOUT_SECONDS,
+        "env": _plugin_runtime_env(),
     }
     if plugin_home is not None:
         run_kwargs["cwd"] = str(plugin_home)
