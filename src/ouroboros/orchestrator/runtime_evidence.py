@@ -231,6 +231,16 @@ class HeadlessRunProbe:
             )
         except subprocess.TimeoutExpired as exc:
             duration = time.monotonic() - start
+            stdout = (
+                exc.stdout.decode("utf-8", errors="replace")
+                if isinstance(exc.stdout, bytes)
+                else (exc.stdout or "")
+            )
+            stderr = (
+                exc.stderr.decode("utf-8", errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "")
+            )
             return RuntimeEvidence(
                 probe_kind=self.kind,
                 passed=False,
@@ -241,8 +251,8 @@ class HeadlessRunProbe:
                 payload={
                     "argv": argv,
                     "timeout_seconds": timeout_seconds,
-                    "stdout_preview": _truncate(exc.stdout or ""),
-                    "stderr_preview": _truncate(exc.stderr or ""),
+                    "stdout_preview": _truncate(stdout),
+                    "stderr_preview": _truncate(stderr),
                     "outcome": "timeout",
                 },
             )
