@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     # Imported under TYPE_CHECKING to avoid a runtime cycle: adapters.py
     # imports ``InterviewBackend`` / ``InterviewTurn`` from this module.
     from ouroboros.auto.adapters import LateralResult
+    from ouroboros.persistence.event_store import EventStore
 
 import structlog
 
@@ -36,9 +37,84 @@ from ouroboros.auto.safe_defaults import (
     finalize_safe_defaultable_gaps,
 )
 from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore
+from ouroboros.events.base import BaseEvent
 from ouroboros.resilience.lateral import ThinkingPersona
 
 log = structlog.get_logger(__name__)
+
+# RFC #1256 §I4 — observer is OFF the pipeline's critical path.
+#
+# The §I4 fail-open contract requires that EventStore persistence
+# cannot weaken cancellation, phase deadlines, or the top-level run
+# budget. The naive shape (`await self.event_store.append(...)` inline)
+# violates this because `AutoPipeline.run` wraps the driver in
+# `asyncio.wait_for(self.interview_driver.run(state, ledger),
+# timeout=_deadline_capped_timeout(...))` at
+# `src/ouroboros/auto/pipeline.py:602`, and the cap can validly fall
+# BELOW the observer's own fail-open bound when the top-level deadline
+# is nearly expired (or when `phase_timeout_seconds(INTERVIEW)` is
+# set to 1 via persisted/env policy). A bounded inline await still
+# spends the remaining pipeline budget — bot review on commit
+# 4fd6cfc1 (req_1779890159_141) reproduced this: a 5 s slow `opened`
+# append + `asyncio.wait_for(driver.run(...), timeout=0.1)` raised
+# `TimeoutError` after ~0.102 s, before `_run_inner` ever ran.
+#
+# The fix moves the append off the critical path entirely:
+# `_emit_event` schedules a background `asyncio.Task` and returns
+# immediately. The pipeline's wait_for never sees observer latency.
+# Each background task is still bounded by
+# `_EVENT_STORE_EMIT_TIMEOUT_SECONDS` so a stuck observer cannot
+# leak indefinitely; exceptions and timeouts are downgraded to
+# typed structlog warnings.
+#
+# Tasks are tracked on `_pending_emit_tasks` so tests/operators can
+# `await driver.wait_for_pending_emits()` for deterministic
+# inspection. The set is cleared via `add_done_callback` so it never
+# grows unbounded.
+_EVENT_STORE_EMIT_TIMEOUT_SECONDS = 1.0
+
+# RFC #1256 §I4 — durability is a COMPOSITION-ROOT responsibility.
+#
+# The driver intentionally does NOT drain ``_pending_emit_tasks``
+# inside ``run()``. Two prior bot blockers explain why both extremes
+# fail:
+#
+# * Fire-and-forget with no drain anywhere (commit ef0fec17,
+#   req_1779891123_145) silently loses every event when the owning
+#   event loop closes — the bot reproduced this with a 0.01 s append
+#   store and ``asyncio.run(driver.run(...))``.
+# * Drain inside ``run()`` (commit c5549124, req_1779938459_153)
+#   re-introduces observer latency on the pipeline-critical path:
+#   ``AutoPipeline.run`` wraps ``driver.run`` in
+#   ``asyncio.wait_for(..., timeout=interview_timeout)``, so even a
+#   50 ms drain after a 0.08 s ``_run_inner`` converts a completed
+#   interview into an interview-phase timeout at the deadline-capped
+#   budget (bot probe: ``_run_inner`` at 0.08 s + 0.2 s append +
+#   outer 0.1 s ``wait_for`` → ``TimeoutError`` at ~0.102 s).
+#
+# The stable shape: ``_emit_event`` schedules persistence as a
+# background ``asyncio.Task`` and returns immediately; ``run()``
+# never awaits the pending set. Composition roots (``AutoPipeline``
+# is the production owner today; future CLI/MCP composition roots
+# when the next wiring slice lands) are responsible for calling
+# ``await driver.wait_for_pending_emits()`` — typically under their
+# own bounded shield — OUTSIDE their critical ``wait_for`` boundary so:
+#
+#   1. The §I4 substrate contract — "supply an EventStore, get
+#      queryable lifecycle evidence" — is honoured by the post-result
+#      drain that the composition root owns.
+#   2. The interview phase's hard deadline budget is never spent by
+#      observability work; a slow EventStore cannot weaken
+#      cancellation, phase timeouts, or top-level deadline
+#      enforcement.
+#
+# ``AutoPipeline.run`` implements this contract via
+# ``_drain_interview_observer_events`` (see pipeline.py) on both the
+# clean-exit and timeout-exit paths of the interview ``wait_for``,
+# with a bounded ``asyncio.shield`` so the drain itself cannot be
+# cancelled by a top-level deadline once it begins, and a fail-open
+# timeout that downgrades pathologically slow observers to a typed
+# structlog warning.
 
 INTERVIEW_SAFE_DEFAULT_SYNTHESIS_STOP_REASON_CODE = "interview_safe_default_synthesis_incomplete"
 
@@ -176,7 +252,138 @@ class AutoInterviewDriver:
     # tests that construct the driver without this argument are unaffected.
     # The behavior change that consumes this field ships in a separate PR.
     lateral_thinker: LateralThinker | None = None
+    # RFC #1256 §I4 — Unified observability for ooo auto interview.
+    # When set, the driver emits typed ``auto.interview.*`` events to the
+    # EventStore alongside the existing structlog ``log.info(...)`` calls,
+    # so post-hoc evidence inspection via ``ouroboros_query_events`` can
+    # surface the interview's lifecycle. Defaults to ``None`` to preserve
+    # back-compat for every existing call site (CLI, MCP handler, tests)
+    # that constructs the driver without observability wiring. Errors
+    # raised by the event store are caught and logged as warnings — an
+    # observer is never permitted to break the interview loop.
+    event_store: EventStore | None = None
     _last_emitted_message: str | None = field(default=None, init=False, repr=False)
+    # Track outstanding background `_emit_event` tasks so tests and
+    # operators can await deterministic completion via
+    # ``wait_for_pending_emits``. The set is cleaned up via
+    # ``add_done_callback`` so it never grows unbounded — see the
+    # module-level comment on ``_EVENT_STORE_EMIT_TIMEOUT_SECONDS``.
+    _pending_emit_tasks: set[asyncio.Task[None]] = field(
+        default_factory=set, init=False, repr=False
+    )
+
+    async def _append_with_fail_open(
+        self,
+        event_type: str,
+        aggregate_id: str,
+        data: dict[str, object],
+    ) -> None:
+        """Append a single event with bounded fail-open semantics.
+
+        Runs inside the background task scheduled by :meth:`_emit_event`.
+        Bounded by ``_EVENT_STORE_EMIT_TIMEOUT_SECONDS`` so a stuck
+        observer cannot leak indefinitely; timeouts and exceptions are
+        downgraded to typed structlog warnings.
+        """
+        assert self.event_store is not None  # guarded by caller
+        try:
+            await asyncio.wait_for(
+                self.event_store.append(
+                    BaseEvent(
+                        type=event_type,
+                        aggregate_type="auto_interview",
+                        aggregate_id=aggregate_id,
+                        data=data,
+                    )
+                ),
+                timeout=_EVENT_STORE_EMIT_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            log.warning(
+                "auto.interview.event_store_emit_timed_out",
+                event_type=event_type,
+                auto_session_id=aggregate_id,
+                timeout_seconds=_EVENT_STORE_EMIT_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            # Background task cancelled (e.g. event loop shutdown).
+            # The §I4 contract treats observer loss during shutdown
+            # as acceptable; re-raising would surface as an unhandled
+            # task exception in logs without operator-actionable
+            # information.
+            return
+        except Exception as exc:  # noqa: BLE001 — observer must not break the loop
+            log.warning(
+                "auto.interview.event_store_emit_failed",
+                event_type=event_type,
+                auto_session_id=aggregate_id,
+                error=str(exc),
+            )
+
+    async def _emit_event(
+        self,
+        event_type: str,
+        aggregate_id: str | None,
+        **data: object,
+    ) -> None:
+        """Schedule a typed ``auto.interview.*`` event for background
+        persistence.
+
+        The append is **dispatched as a background** ``asyncio.Task``
+        **and not awaited** so EventStore latency never consumes the
+        pipeline-side ``asyncio.wait_for(interview_timeout)`` budget
+        (see the module-level comment for the full rationale and the
+        bot-review reproducers that motivated the dispatch shape).
+
+        The method is ``async`` so call sites keep ``await
+        self._emit_event(...)`` as the syntactic anchor; the body
+        completes in O(``create_task``) — no I/O on the critical path.
+        Background errors and timeouts are downgraded to typed
+        structlog warnings inside :meth:`_append_with_fail_open`;
+        the interview loop is never blocked by observability.
+
+        ``aggregate_id`` is the ``auto_session_id`` of the live state
+        so ``ouroboros_query_events(auto_session_id)`` finds every
+        interview event for that session.
+        """
+        if self.event_store is None:
+            return
+        if not aggregate_id:
+            return
+        task = asyncio.create_task(
+            self._append_with_fail_open(event_type, aggregate_id, dict(data))
+        )
+        # Hold a strong reference so the task is not garbage-collected
+        # mid-flight, and clean it up on completion so the set stays
+        # bounded.
+        self._pending_emit_tasks.add(task)
+        task.add_done_callback(self._pending_emit_tasks.discard)
+
+    async def wait_for_pending_emits(self) -> None:
+        """Await every outstanding background emit task.
+
+        Composition-root durability boundary per the §I4 contract
+        (see module-level comment): ``_emit_event`` schedules typed
+        ``auto.interview.*`` appends as background tasks and ``run()``
+        never awaits them, so observability work cannot weaken the
+        pipeline's ``asyncio.wait_for(interview_timeout)`` budget.
+        Composition roots (``AutoPipeline`` today via
+        ``_drain_interview_observer_events``; future CLI/MCP roots
+        when their wiring slice lands) call this method OUTSIDE their
+        critical ``wait_for`` to persist scheduled lifecycle events
+        before continuing — typically under their own bounded
+        ``asyncio.shield`` so a slow observer cannot extend the
+        post-result phase indefinitely.
+
+        Exceptions are not propagated — the same fail-open contract
+        that downgrades errors inside the task applies here. The
+        method returns once every currently-pending task is done.
+        Tasks scheduled during the await are gathered in the next
+        iteration of the while-loop.
+        """
+        while self._pending_emit_tasks:
+            pending = list(self._pending_emit_tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _emit(self, state: AutoPipelineState) -> None:
         """Emit a progress snapshot for the current state via the callback.
@@ -203,7 +410,76 @@ class AutoInterviewDriver:
             pass
 
     async def run(self, state: AutoPipelineState, ledger: SeedDraftLedger) -> AutoInterviewResult:
-        """Run bounded auto interview until Seed-ready or blocked."""
+        """Run bounded auto interview until Seed-ready or blocked.
+
+        Public entry point that wraps :meth:`_run_inner` with RFC #1256 §I4
+        lifecycle event emission: ``auto.interview.opened`` before the loop
+        starts, and ``auto.interview.finalized`` (or
+        ``auto.interview.failed`` if an exception escapes the inner loop)
+        once a terminal result is known. The 13 internal ``return
+        AutoInterviewResult(...)`` paths inside ``_run_inner`` keep their
+        existing structlog instrumentation untouched; this wrapper only
+        adds the typed events that ``ouroboros_query_events`` consumes.
+        """
+
+        await self._emit_event(
+            "auto.interview.opened",
+            state.auto_session_id,
+            goal=state.goal,
+            max_rounds=self.max_rounds,
+            cwd=state.cwd,
+            resumed=bool(state.interview_session_id),
+        )
+        try:
+            result = await self._run_inner(state, ledger)
+        except Exception as exc:
+            # NOTE: we intentionally catch ``Exception`` (NOT
+            # ``BaseException``) so ``asyncio.CancelledError`` — which
+            # inherits from ``BaseException`` — propagates immediately
+            # without awaiting the best-effort ``_emit_event`` append.
+            # ``AutoPipeline.run`` wraps this call in
+            # ``asyncio.wait_for(..., timeout=interview_timeout)``; if
+            # the wrapper awaited persistence during cancellation, the
+            # phase deadline could be exceeded by whatever the
+            # EventStore's append latency happens to be. The §I4
+            # observer must never weaken deadlines or cancellation —
+            # that is a hard runtime control path, not a
+            # best-effort persistence path. Bot review on commit
+            # 0a1a9c34 (req_1779886484_124) reproduced the overrun
+            # with a 0.05s wait_for and a 0.2s blocking append; the
+            # narrowed catch closes that contract failure.
+            await self._emit_event(
+                "auto.interview.failed",
+                state.auto_session_id,
+                exception_type=type(exc).__name__,
+                exception_message=str(exc)[:500],
+            )
+            raise
+        await self._emit_event(
+            "auto.interview.finalized",
+            state.auto_session_id,
+            status=result.status,
+            rounds=result.rounds,
+            interview_session_id=result.session_id,
+            blocker=(result.blocker or "")[:500],
+        )
+        # NOTE: deliberately no drain here. ``_emit_event`` schedules
+        # the typed lifecycle appends as background tasks; the
+        # composition root (``AutoPipeline._drain_interview_observer_events``
+        # for the production wiring path; see pipeline.py) is
+        # responsible for awaiting them OUTSIDE the pipeline-side
+        # ``asyncio.wait_for(interview_timeout)`` boundary so a slow
+        # EventStore cannot turn a completed interview into a phase
+        # timeout. Bot review on commit ``c5549124``
+        # (req_1779938459_153) reproduced the contract failure when
+        # this drain ran inside ``run()``. See the module-level
+        # comment for the full rationale.
+        return result
+
+    async def _run_inner(
+        self, state: AutoPipelineState, ledger: SeedDraftLedger
+    ) -> AutoInterviewResult:
+        """Bounded auto interview loop. See :meth:`run` for §I4 wrapping."""
         self._last_emitted_message = None
         self._ensure_interview_phase(state)
         answer_context = self.context_provider(state.cwd)
