@@ -21,6 +21,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **mcp/security**: `FREETEXT_FIELDS` allowlist for user-input fields (goals, prompts, descriptions) — shell metacharacters (`;`, `|`, `&`, backticks, `$()`) are no longer rejected in fields where they are legitimate prose. Structural fields remain strictly validated.
 - **opencode/bridge**: Robustness hardening (v22) — no uncaught errors under any input. Adds reject-path logging, frozen-content guards, empty-sessionID guard, client init-order guard, 5-second FNV-1a prompt dedupe, 100 KB prompt byte cap with truncation marker, user-visible `surfaceErr()` for dispatch failures (no more silent "dispatched but never ran"), and an absolute outer try/catch so the plugin cannot throw into the opencode runLoop.
 
+## [0.41.0] - 2026-06-07
+
+> Run it anywhere, and trust what it ships. Pi joins as a first-class runtime,
+> the Socratic interview convenes a multi-persona panel at every ambiguity
+> milestone, and the verifier's "done" verdict becomes typed, audited, and
+> impossible to game.
+
+### Added
+- **providers**: Pi LLM adapter (`PiLLMAdapter`) for `--llm-backend pi` — `pi` /
+  `pi_cli` registered as LLM- and interview-driver-capable in the backend
+  registry and provider factory; Pi-aware default-model normalization so the
+  default uses Pi's own backend default instead of forwarding an Anthropic model
+  name (#1326)
+- **runtime**: `ouroboros setup --runtime pi` wires the managed Pi bridge setup
+  surface (5c674c11)
+- **interview**: milestone lateral-review **dispatch** (promoted from advisory) —
+  at `initial→progress`, `progress→refined`, `refined→ready` transitions the main
+  session runs `ouroboros_lateral_think` with researcher/contrarian/simplifier
+  (+architect when system shape changes) before answering or asking the returned
+  question, folding findings into 2–3 concrete options or a recommended draft.
+  Adds the `run_lateral_review` interview capability and per-runtime
+  capability/instruction artifacts (9d229c4c)
+- **harness**: promote TraceGuard verdict admission into `VerifierVerdict` —
+  typed status, evidence refs, and `retry_admission`; ACCEPT / RETRY / REDISPATCH /
+  ESCALATE_MODEL / ESCALATE_HUMAN / BLOCK persisted on atomic typed-evidence
+  events (RFC #814) (#1330)
+
+### Changed
+- **config**: centralize every default Claude model pin into one source of truth
+  (`_model_defaults.py`) and pin exact snapshots rather than the `"default"`
+  sentinel for reproducible grading — Opus reasoning tier → 4.8, Sonnet judgment
+  tier (`qa_model`) pinned at 4.6, retiring the dated `claude-sonnet-4-20250514`
+  (#1324, #1323)
+- **harness/h7**: prefer `VerifierVerdict.retry_admission` over the
+  failure-class-derived policy when an explicit admission is present; re-run the
+  same leaf only on `RETRY` (#1331)
+- **auto**: gate runs on backend-confirmed low ambiguity (≤ 0.20) plus a pre-run
+  Seed QA pass, feeding QA findings into bounded Seed-repair attempts before
+  blocking (#1302)
+- **auto**: normalize worktree-policy aliases (e.g. `create_isolated_worktree →
+  always`) and fail fast when `complete_product=true` is paired with a too-short
+  timeout (#1305)
+- **deps**: prune unused optional packages (#1301)
+
+### Fixed
+- **pi**: align the runtime with documented JSON mode (#1321)
+- **pi**: report malformed runtime events as a typed `ProviderError` (#1325)
+- **orchestrator**: classify masked test evidence (`… | tail`) as
+  `EVIDENCE_FORM_MISMATCH` — retryable with actionable feedback (e.g.
+  `set -o pipefail`) — instead of `FABRICATION_SUSPECTED`; the #1208 guard holds
+  (#1292)
+- **installer**: run `setup` with the freshly installed `ouroboros` binary, not a
+  stale one on `PATH`; preserve existing `PATH` precedence on pipx/pip paths
+  (#1345, #1343)
+- **opencode**: cover Windows cleanup review blockers (#1320)
+- **goose**: keep LLM completion calls profile-free (#1303)
+- **run**: guard the home directory in `_detect_project_root_from_seed_path`
+  (#1313)
+- **deps**: pin `typer` before the vendored `click` to stabilize resolution
+  (#1300)
+
+### Testing
+- **orchestrator**: opt-in native Pi CLI smoke test (#1329)
+
+### Docs
+- Pi provider surfaces (#1327) and Pi runtime guide; fix shipped-backend wording
+  (#1332); AgentOS issue-sequencing graph snapshot (#1293); Verdict Envelope v1
+  RFC and verifier-evidence-policy; runtime-capability-matrix and
+  contributing/key-patterns updates
+
 ## [0.14.1] - 2025-02-27
 
 ### Fixed
