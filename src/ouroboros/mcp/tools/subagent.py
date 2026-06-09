@@ -32,11 +32,13 @@ Payload structure:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import json
 import re
 from typing import Any
 
+from jsonschema import Draft202012Validator
 import structlog
 
 from ouroboros.core.seed_contract_prompt import render_auto_recursion_guard
@@ -59,6 +61,156 @@ _INTERVIEW_SUBAGENT_MAX_ANSWER_CHARS = 300
 def _canonical_response_json(body: dict[str, Any]) -> str:
     """Render structured MCP dispatch content with deterministic key order."""
     return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
+def _contract_violations_for_code_investigation_output(
+    request: Mapping[str, Any],
+    output: Mapping[str, Any],
+) -> list[str]:
+    contract = request.get("answer_contract")
+    if not isinstance(contract, Mapping):
+        return ["missing answer_contract"]
+    response_schema = contract.get("response_model_schema")
+    if not isinstance(response_schema, Mapping):
+        return ["missing answer_contract.response_model_schema"]
+
+    validator = Draft202012Validator(response_schema)
+    return sorted(error.message for error in validator.iter_errors(dict(output)))
+
+
+def _requires_code_investigation_confirmation(output: Mapping[str, Any]) -> bool:
+    answer_prefix = output.get("answer_prefix")
+    confidence = output.get("confidence")
+    if answer_prefix != "[from-code][auto-confirmed]":
+        return True
+    if confidence != "high_exact_match":
+        return True
+    return output.get("requires_user_confirmation") is not False
+
+
+def _default_code_investigation_confirmation_prompt(output: Mapping[str, Any]) -> str:
+    answer_text = str(output.get("answer_text") or "the code investigation result").strip()
+    if len(answer_text) > _INTERVIEW_SUBAGENT_MAX_ANSWER_CHARS:
+        answer_text = answer_text[: _INTERVIEW_SUBAGENT_MAX_ANSWER_CHARS - 1].rstrip() + "…"
+    return f"Confirm before forwarding this code-derived answer: {answer_text}"
+
+
+def synthesize_code_investigation_when_complete(
+    request: Mapping[str, Any],
+    investigation_results: Mapping[str, Any],
+    synthesizer: Any,
+) -> dict[str, Any]:
+    """Collect code-fact investigation outputs before interview synthesis."""
+    session_id = str(request.get("session_id") or "")
+    question_identity = str(request.get("question_identity") or "")
+    required_ids = request.get("required_result_ids")
+    if isinstance(required_ids, (list, tuple)) and required_ids:
+        expected_result_ids = [str(item) for item in required_ids]
+    else:
+        expected_result_ids = ["code_facts"]
+
+    outputs_by_result_id: dict[str, Any] = {}
+    for result_id, output in investigation_results.items():
+        normalized_result_id = str(result_id)
+        if normalized_result_id not in expected_result_ids:
+            continue
+        if not isinstance(output, Mapping):
+            continue
+        if str(output.get("session_id") or "") != session_id:
+            continue
+        if str(output.get("question_identity") or "") != question_identity:
+            continue
+        outputs_by_result_id[normalized_result_id] = output
+
+    missing_result_ids = [
+        result_id for result_id in expected_result_ids if result_id not in outputs_by_result_id
+    ]
+    aggregated_outputs = [
+        {
+            "result_id": result_id,
+            "output": outputs_by_result_id[result_id],
+        }
+        for result_id in expected_result_ids
+        if result_id in outputs_by_result_id
+    ]
+    if missing_result_ids:
+        return {
+            "ready_for_synthesis": False,
+            "expected_result_ids": expected_result_ids,
+            "missing_result_ids": missing_result_ids,
+            "aggregated_outputs": aggregated_outputs,
+            "synthesis": None,
+            "requires_user_confirmation": False,
+            "confirmation_required_result_ids": [],
+            "user_confirmation_prompts": [],
+            "contract_violations": [],
+            "ready_for_forward": False,
+        }
+
+    contract_violations = [
+        {
+            "result_id": str(item["result_id"]),
+            "errors": violations,
+        }
+        for item in aggregated_outputs
+        if (
+            violations := _contract_violations_for_code_investigation_output(
+                request, item["output"]
+            )
+        )
+    ]
+    contract_violation_result_ids = {str(item["result_id"]) for item in contract_violations}
+    confirmation_required = []
+    for item in aggregated_outputs:
+        result_id = str(item["result_id"])
+        output = item["output"]
+        if result_id in contract_violation_result_ids or _requires_code_investigation_confirmation(
+            output
+        ):
+            confirmation_required.append(item)
+
+    confirmation_required_result_ids = [str(item["result_id"]) for item in confirmation_required]
+    user_confirmation_prompts = [
+        str(prompt)
+        for item in confirmation_required
+        if (prompt := item["output"].get("user_confirmation_prompt"))
+    ]
+    if len(user_confirmation_prompts) < len(confirmation_required):
+        user_confirmation_prompts.extend(
+            _default_code_investigation_confirmation_prompt(item["output"])
+            for item in confirmation_required
+            if not item["output"].get("user_confirmation_prompt")
+        )
+    synthesis = None if contract_violations else synthesizer(aggregated_outputs)
+    return {
+        "ready_for_synthesis": True,
+        "expected_result_ids": expected_result_ids,
+        "missing_result_ids": [],
+        "aggregated_outputs": aggregated_outputs,
+        "synthesis": synthesis,
+        "requires_user_confirmation": bool(confirmation_required),
+        "confirmation_required_result_ids": confirmation_required_result_ids,
+        "user_confirmation_prompts": user_confirmation_prompts,
+        "contract_violations": contract_violations,
+        "ready_for_forward": not confirmation_required,
+    }
+
+
+def lateral_persona_panel_metadata_from_capability_definitions() -> dict[str, Any]:
+    """Read lateral persona panel metadata from Ouroboros tool capabilities."""
+    from ouroboros.mcp.tools.definitions import get_ouroboros_tools
+    from ouroboros.orchestrator.capabilities import build_capability_graph
+    from ouroboros.orchestrator.mcp_tools import assemble_session_tool_catalog
+
+    owned_tools = tuple(handler.definition for handler in get_ouroboros_tools())
+    graph = build_capability_graph(assemble_session_tool_catalog(attached_tools=owned_tools))
+    for descriptor in graph.capabilities:
+        if descriptor.name != "ouroboros_lateral_think" or descriptor.metadata is None:
+            continue
+        panel = descriptor.metadata.orchestration.get("lateral_panel")
+        if isinstance(panel, Mapping):
+            return dict(panel)
+    return {}
 
 
 # ---------------------------------------------------------------------------
