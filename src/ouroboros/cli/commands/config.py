@@ -19,13 +19,60 @@ from ouroboros.backends import (
 )
 from ouroboros.cli.formatters import console
 from ouroboros.cli.formatters.panels import print_error, print_info, print_success, print_warning
-from ouroboros.cli.formatters.tables import create_key_value_table, print_table
+from ouroboros.cli.formatters.tables import create_key_value_table, create_table, print_table
 
 app = typer.Typer(
     name="config",
     help="Manage Ouroboros configuration.",
-    no_args_is_help=True,
+    no_args_is_help=False,
 )
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    web: Annotated[
+        bool,
+        typer.Option("--web", help="Force web mode even in an interactive terminal."),
+    ] = False,
+    host: Annotated[
+        str,
+        typer.Option(
+            "--host",
+            help="Web-mode bind address. Use 0.0.0.0 to reach the GUI from another "
+            "machine when this host runs a remote agent (e.g. hermes).",
+        ),
+    ] = "localhost",
+    port: Annotated[
+        int | None,
+        typer.Option("--port", help="Web-mode port (default: a free port)."),
+    ] = None,
+    no_browser: Annotated[
+        bool,
+        typer.Option(
+            "--no-browser",
+            help="Never auto-open a browser; just print the URL (remote/SSH hosts).",
+        ),
+    ] = False,
+) -> None:
+    """Manage Ouroboros configuration.
+
+    Without a subcommand, opens the interactive settings GUI: a full-screen
+    TUI in a regular terminal, or a browser-served session inside an AI
+    harness (#1414). On remote/agent hosts (SSH, chat gateways) web mode
+    prints a reachable URL instead of opening a browser there. Subcommands
+    keep the scriptable surface unchanged.
+    """
+    if ctx.invoked_subcommand is None:
+        from ouroboros.config_tui.launcher import launch_settings
+
+        launch_settings(
+            force_web=web,
+            host=host,
+            port=port,
+            open_browser=False if no_browser else None,
+        )
+
 
 _VALID_BACKENDS = runtime_backend_choices()
 _SWITCHABLE_BACKENDS = tuple(
@@ -113,18 +160,206 @@ def _resolve_db_path(data: dict, config_path: Path) -> str:
     return f"ouroboros.db ({resolved})"
 
 
+def _effective_value(
+    env_vars: tuple[str, ...],
+    raw_value: object,
+    default: object,
+) -> tuple[str, str]:
+    """Resolve the effective value and its source (env > config > default)."""
+    import os
+
+    for name in env_vars:
+        env_value = os.environ.get(name, "").strip()
+        if env_value:
+            return env_value, f"env {name} ⚠"
+    if raw_value is not None:
+        return str(raw_value), "config"
+    return str(default), "default"
+
+
+def _effective_llm_backend_value(raw_value: object) -> tuple[str, str]:
+    """Resolve the effective LLM backend using the loader's env fallback order."""
+    import os
+
+    env_backend = os.environ.get("OUROBOROS_LLM_BACKEND", "").strip()
+    if env_backend:
+        return env_backend, "env OUROBOROS_LLM_BACKEND ⚠"
+
+    env_runtime = os.environ.get("OUROBOROS_RUNTIME", "").strip()
+    capability = get_backend_capability(env_runtime)
+    if capability is not None and capability.supports_llm:
+        if env_runtime.strip().lower() == "claude_code":
+            return "claude_code", "env OUROBOROS_RUNTIME ⚠"
+        return capability.name, "env OUROBOROS_RUNTIME ⚠"
+
+    if raw_value is not None:
+        return str(raw_value), "config"
+    return "claude_code", "default"
+
+
+def _agent_cell(backend: str, installed: dict[str, str | None]) -> str:
+    """Render an agent name with an install marker."""
+    return backend if installed.get(backend) else f"{backend} ⚠ not installed"
+
+
+def _effective_view_data(data: dict, config_path: Path) -> dict:
+    """Machine-readable effective view (what `show --json` emits)."""
+    from ouroboros.backends.model_catalog import installed_backends
+    from ouroboros.config_tui.fields import (
+        GLOBAL_LLM_BACKEND_FIELD,
+        GLOBAL_RUNTIME_FIELD,
+        STAGE_MODEL_FIELDS,
+        get_value,
+    )
+    from ouroboros.orchestrator_stage import Stage
+
+    installed = installed_backends()
+    agent_value, agent_source = _effective_value(
+        GLOBAL_RUNTIME_FIELD.env_vars,
+        get_value(data, GLOBAL_RUNTIME_FIELD.key),
+        "claude",
+    )
+    llm_value, llm_source = _effective_llm_backend_value(
+        get_value(data, GLOBAL_LLM_BACKEND_FIELD.key)
+    )
+    profile_default = get_value(data, "orchestrator.runtime_profile.default")
+    stages: dict[str, dict] = {}
+    for stage in Stage:
+        stage_agent = get_value(data, f"orchestrator.runtime_profile.stages.{stage.value}")
+        resolved = str(stage_agent or profile_default or agent_value)
+        model_field = STAGE_MODEL_FIELDS[stage]
+        model_value, model_source = _effective_value(
+            model_field.env_vars,
+            get_value(data, model_field.key),
+            "backend default",
+        )
+        stages[stage.value] = {
+            "agent": resolved,
+            "inherited": stage_agent is None,
+            "agent_installed": bool(installed.get(resolved)),
+            "model": model_value,
+            "model_source": model_source,
+            "model_key": model_field.key,
+        }
+    return {
+        "defaults": {
+            "default_agent": {
+                "value": agent_value,
+                "source": agent_source,
+                "installed": bool(installed.get(agent_value)),
+            },
+            "llm_backend": {"value": llm_value, "source": llm_source},
+        },
+        "stages": stages,
+        "environment": {
+            "config_path": str(config_path),
+            "cli_path": _resolve_cli_path(data),
+            "database": _resolve_db_path(data, config_path),
+            "log_level": str(data.get("logging", {}).get("level", "info")),
+        },
+    }
+
+
+def _render_effective_view(data: dict, config_path: Path) -> None:
+    """GUI-equivalent effective view: defaults, per-stage agents/models, sources.
+
+    This is the text surface chat-gateway agents (e.g. hermes via Discord)
+    relay when no browser or TUI can reach the user, so it must carry the
+    same information the settings GUI shows: resolved inheritance, env
+    overrides, and install status (#1395's effective-view concern).
+    """
+    from ouroboros.backends.model_catalog import installed_backends
+    from ouroboros.config_tui.fields import (
+        GLOBAL_LLM_BACKEND_FIELD,
+        GLOBAL_RUNTIME_FIELD,
+        STAGE_MODEL_FIELDS,
+        get_value,
+    )
+    from ouroboros.orchestrator_stage import Stage
+
+    installed = installed_backends()
+
+    defaults_table = create_table("Defaults", show_lines=False)
+    defaults_table.add_column("Setting", style="cyan")
+    defaults_table.add_column("Value")
+    defaults_table.add_column("Source", style="dim")
+    agent_value, agent_source = _effective_value(
+        GLOBAL_RUNTIME_FIELD.env_vars,
+        get_value(data, GLOBAL_RUNTIME_FIELD.key),
+        "claude",
+    )
+    defaults_table.add_row("Default agent", _agent_cell(agent_value, installed), agent_source)
+    llm_value, llm_source = _effective_llm_backend_value(
+        get_value(data, GLOBAL_LLM_BACKEND_FIELD.key)
+    )
+    defaults_table.add_row("LLM backend (internal calls)", llm_value, llm_source)
+    print_table(defaults_table)
+
+    stages_table = create_table("Per-stage overrides", show_lines=False)
+    stages_table.add_column("Stage", style="cyan")
+    stages_table.add_column("Agent")
+    stages_table.add_column("Model")
+    stages_table.add_column("Model source", style="dim")
+    profile_default = get_value(data, "orchestrator.runtime_profile.default")
+    for stage in Stage:
+        stage_agent = get_value(data, f"orchestrator.runtime_profile.stages.{stage.value}")
+        if stage_agent:
+            agent_cell = _agent_cell(str(stage_agent), installed)
+        else:
+            resolved = str(profile_default or agent_value)
+            agent_cell = f"(inherit) → {_agent_cell(resolved, installed)}"
+        model_field = STAGE_MODEL_FIELDS[stage]
+        model_value, model_source = _effective_value(
+            model_field.env_vars,
+            get_value(data, model_field.key),
+            "backend default",
+        )
+        stages_table.add_row(stage.value, agent_cell, model_value, model_source)
+    print_table(stages_table)
+
+    env_table = create_key_value_table(
+        {
+            "config_path": str(config_path),
+            "cli_path": _resolve_cli_path(data) or "?",
+            "database": _resolve_db_path(data, config_path),
+            "log_level": str(data.get("logging", {}).get("level", "info")),
+        },
+        "Environment",
+    )
+    print_table(env_table)
+    console.print(
+        "[dim]Change values: settings GUI (`ouroboros config`) or "
+        "`ouroboros config set <key> <value>`. "
+        "⚠ env sources override saved config until unset.[/dim]"
+    )
+
+
 @app.command()
 def show(
     section: Annotated[
         str | None,
         typer.Argument(help="Configuration section to display (e.g., 'orchestrator')."),
     ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the effective view as JSON (for agents/scripts)."),
+    ] = False,
 ) -> None:
-    """Display current configuration.
+    """Display the effective configuration.
 
-    Shows all configuration if no section specified.
+    Without arguments, renders the GUI-equivalent effective view: defaults,
+    per-stage agents and models with resolved inheritance, value sources
+    (env override / config / default), and CLI install status. Pass a
+    section name for the raw section contents, or --json for a
+    machine-readable effective view.
     """
     data, config_path = _load_config()
+
+    if json_output:
+        import json
+
+        typer.echo(json.dumps(_effective_view_data(data, config_path), indent=2))
+        return
 
     if section:
         section_data = data.get(section)
@@ -140,16 +375,7 @@ def show(
         else:
             console.print(f"[cyan]{section}[/] = {section_data}")
     else:
-        config_summary = {
-            "config_path": str(config_path),
-            "runtime_backend": data.get("orchestrator", {}).get("runtime_backend", "?"),
-            "llm_backend": data.get("llm", {}).get("backend", "?"),
-            "cli_path": _resolve_cli_path(data) or "?",
-            "database": _resolve_db_path(data, config_path),
-            "log_level": data.get("logging", {}).get("level", "info"),
-        }
-        table = create_key_value_table(config_summary, "Current Configuration")
-        print_table(table)
+        _render_effective_view(data, config_path)
 
 
 @app.command()
@@ -469,6 +695,41 @@ def set_value(
         print_success(f"{key}: {old_value} → {parsed_value}")
     else:
         print_success(f"{key}: {parsed_value}")
+
+
+@app.command()
+def undo() -> None:
+    """Restore the configuration saved before the last settings change.
+
+    Every successful save (GUI or `config set` via the settings layer)
+    keeps the previous file as config.yaml.bak; undo swaps it back in,
+    so running undo twice redoes the change.
+    """
+    from ouroboros.config.models import get_config_dir
+
+    config_path = get_config_dir() / "config.yaml"
+    backup_path = get_config_dir() / "config.yaml.bak"
+    if not backup_path.exists():
+        print_error("Nothing to undo: no config.yaml.bak found.")
+        raise typer.Exit(1)
+    if not config_path.exists():
+        print_error(f"Config not found: {config_path}")
+        raise typer.Exit(1)
+
+    current_text = config_path.read_text()
+    backup_text = backup_path.read_text()
+    config_path.write_text(backup_text)
+    try:
+        from ouroboros.config.loader import load_config
+
+        load_config()
+    except Exception as exc:
+        config_path.write_text(current_text)
+        print_error(f"Backup is not a valid config — undo aborted.\n{exc}")
+        raise typer.Exit(1) from None
+    # Swap: the replaced config becomes the new backup, so undo ↔ redo.
+    backup_path.write_text(current_text)
+    print_success("Restored previous configuration (run undo again to redo).")
 
 
 @app.command()
