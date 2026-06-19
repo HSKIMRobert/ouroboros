@@ -44,6 +44,19 @@ The Ouroboros MCP tools are often registered as **deferred tools** that must be 
 
 **IMPORTANT**: Do NOT skip this step. Do NOT assume MCP tools are unavailable just because they don't appear in your immediate tool list. They are almost always available as deferred tools that need to be loaded first.
 
+**CRITICAL — deferred-schema guard (prevents "Invalid tool parameters"):**
+This skill makes execution MCP calls across multiple turns, and each turn runs
+in a fresh tool context. A deferred tool's schema loaded on one turn is NOT
+guaranteed to still be loaded on the next. If you call any execution `ouroboros_*`
+MCP tool while its schema is not loaded in the **current** turn, the runtime
+rejects the call with **"Invalid tool parameters"** before it reaches the server.
+Therefore: **immediately before EVERY execution MCP call in this skill, re-run
+`ToolSearch query: "+ouroboros execute"`** to reload the execution tool family,
+including `ouroboros_start_execute_seed`, `ouroboros_job_wait`,
+`ouroboros_ac_tree_hud`, and `ouroboros_job_result` (idempotent — a no-op when
+already loaded). If the load returns no matching tool, switch to the documented
+fallback instead of retrying the failing call.
+
 ### Execution Steps
 
 1. **Detect git workflow** (before any code changes):

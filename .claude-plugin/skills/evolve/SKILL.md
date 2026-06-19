@@ -54,6 +54,21 @@ The Ouroboros MCP tools are often registered as **deferred tools** that must be 
 
 **IMPORTANT**: Do NOT skip this step. Do NOT assume MCP tools are unavailable just because they don't appear in your immediate tool list. They are almost always available as deferred tools that need to be loaded first.
 
+**CRITICAL — deferred-schema guard (prevents "Invalid tool parameters"):**
+This skill makes `ouroboros_*` MCP calls across multiple turns, and each turn runs
+in a fresh tool context. A deferred tool's schema loaded on one turn is NOT
+guaranteed to still be loaded on the next. If you call any `ouroboros_*` MCP tool
+while its schema is not loaded in the **current** turn, the runtime rejects the
+call with **"Invalid tool parameters"** before it ever reaches the server.
+Therefore: **immediately before EVERY `ouroboros_*` MCP call in this skill, re-run
+the tool-discovery load query for the specific MCP tool or documented tool family
+you are about to call**. Use `"+ouroboros evolve"` for `ouroboros_evolve_step`,
+`ouroboros_lineage_status`, and the evolve flow's documented tool family;
+use `"+ouroboros interview"` before `ouroboros_interview`, `"+ouroboros seed"`
+before `ouroboros_generate_seed`, and `"+ouroboros lateral"` before
+`ouroboros_lateral_think`. If a load returns no matching tool, switch to the
+documented fallback / Path B instead of retrying the failing call.
+
 ### Path A: MCP Available (loaded via ToolSearch above)
 
 **Starting a new evolutionary loop:**

@@ -52,6 +52,16 @@ The Ouroboros MCP tools are often registered as **deferred tools** that must be 
 
 **IMPORTANT**: Do NOT skip this step. Do NOT assume MCP tools are unavailable just because they don't appear in your immediate tool list. They are almost always available as deferred tools that need to be loaded first.
 
+**CRITICAL — deferred-schema guard (prevents "Invalid tool parameters"):**
+This skill can call `ouroboros_evaluate` after a fresh turn. A deferred tool's
+schema loaded on one turn is NOT guaranteed to still be loaded on the next. If
+you call it while its schema is not loaded in the **current** turn, the runtime
+rejects the call with **"Invalid tool parameters"** before it reaches the server.
+Therefore: **immediately before EVERY `ouroboros_evaluate` call in this skill,
+re-run `ToolSearch query: "+ouroboros evaluate"`** (idempotent — a no-op when
+already loaded). If the load returns no matching tool, switch to the documented
+fallback instead of retrying the failing call.
+
 ### Evaluation Steps
 
 1. Determine what to evaluate:
