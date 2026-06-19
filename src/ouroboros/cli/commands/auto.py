@@ -35,6 +35,10 @@ import ouroboros.auto.profiles  # noqa: F401,E402
 from ouroboros.auto.progress import AutoProgressCallback, AutoProgressEvent
 from ouroboros.auto.provenance import resolve_provenance
 from ouroboros.auto.resume_render import render_resume_lines
+from ouroboros.auto.runtime_routing import (
+    demote_plugin_opencode_mode,
+    resolve_auto_stage_runtime_plan,
+)
 from ouroboros.auto.seed_repairer import SeedRepairer
 from ouroboros.auto.state import (
     DEFAULT_PIPELINE_TIMEOUT_SECONDS,
@@ -349,6 +353,7 @@ async def _run_auto(
     progress_callback: AutoProgressCallback | None = None,
 ) -> AutoPipelineResult:
     store = AutoStore()
+    runtime_override = runtime
     incoming_provenance = resolve_provenance()
     attach_requested = any(
         isinstance(item, str) and item.strip()
@@ -461,6 +466,14 @@ async def _run_auto(
     if worktree_policy is not None:
         state.worktree_policy = parse_auto_worktree_policy(worktree_policy)
 
+    runtime_plan = resolve_auto_stage_runtime_plan(
+        runtime_override=runtime_override,
+        fallback_runtime_backend=runtime,
+        fallback_opencode_mode=state.opencode_mode or get_opencode_mode(),
+    )
+    runtime = runtime_plan.default.runtime_backend
+    raw_default_opencode_mode = runtime_plan.default.opencode_mode
+
     if runtime == "opencode":
         # Q00/ouroboros#782 review-7 BLOCKING #3 + review-8 BLOCKING #1: keep
         # the un-demoted opencode_mode for the Ralph handoff so a CLI launched
@@ -474,12 +487,9 @@ async def _run_auto(
         # honor a previously persisted value on resume — ``state.opencode_mode``
         # itself stores the demoted form (used by authoring/run-handoff
         # handlers), so it cannot serve as a source of truth for plugin Ralph.
-        ralph_opencode_mode = (
-            state.ralph_opencode_mode or state.opencode_mode or get_opencode_mode()
-        )
+        ralph_opencode_mode = state.ralph_opencode_mode or raw_default_opencode_mode
         opencode_mode = ralph_opencode_mode
-        if opencode_mode == "plugin":
-            opencode_mode = "subprocess"
+        opencode_mode = demote_plugin_opencode_mode(opencode_mode)
     else:
         opencode_mode = None
         ralph_opencode_mode = None
@@ -504,18 +514,29 @@ async def _run_auto(
 
     auto_workspace = ensure_auto_worktree(state)
 
-    authoring_opencode_mode = "subprocess" if opencode_mode == "plugin" else opencode_mode
+    authoring_opencode_mode = demote_plugin_opencode_mode(runtime_plan.interview.opencode_mode)
+    execute_opencode_mode = demote_plugin_opencode_mode(runtime_plan.execute.opencode_mode)
     interview = InterviewHandler(
-        agent_runtime_backend=runtime, opencode_mode=authoring_opencode_mode
+        agent_runtime_backend=runtime_plan.interview.runtime_backend,
+        opencode_mode=authoring_opencode_mode,
     )
     generate_seed = GenerateSeedHandler(
-        agent_runtime_backend=runtime, opencode_mode=authoring_opencode_mode
+        agent_runtime_backend=runtime_plan.interview.runtime_backend,
+        opencode_mode=authoring_opencode_mode,
     )
-    execute_seed = ExecuteSeedHandler(agent_runtime_backend=runtime, opencode_mode=opencode_mode)
+    execute_seed = ExecuteSeedHandler(
+        agent_runtime_backend=runtime_plan.execute.runtime_backend,
+        opencode_mode=execute_opencode_mode,
+    )
     start_execute = StartExecuteSeedHandler(
-        execute_handler=execute_seed, agent_runtime_backend=runtime, opencode_mode=opencode_mode
+        execute_handler=execute_seed,
+        agent_runtime_backend=runtime_plan.execute.runtime_backend,
+        opencode_mode=execute_opencode_mode,
     )
-    seed_qa = QAHandler(agent_runtime_backend=runtime, opencode_mode=authoring_opencode_mode)
+    seed_qa = QAHandler(
+        agent_runtime_backend=runtime_plan.interview.runtime_backend,
+        opencode_mode=authoring_opencode_mode,
+    )
     driver = AutoInterviewDriver(
         HandlerInterviewBackend(interview, cwd=state.cwd),
         store=store,
@@ -529,7 +550,14 @@ async def _run_auto(
         # still correct for the authoring/run-handoff handlers above.
         # Q00/ouroboros#1090: use the full MCP composition root rather than a
         # bare RalphHandler so job-mode Ralph has an EvolutionaryLoop.
-        _build_configured_ralph_handler(runtime=runtime, opencode_mode=ralph_opencode_mode)
+        _build_configured_ralph_handler(
+            runtime=runtime_plan.execute.runtime_backend,
+            opencode_mode=(
+                state.ralph_opencode_mode or runtime_plan.execute.opencode_mode
+                if runtime_plan.execute.runtime_backend == "opencode"
+                else None
+            ),
+        )
         if complete_product
         else None
     )
