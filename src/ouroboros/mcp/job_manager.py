@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -116,6 +117,7 @@ _RECOVERED_FAILURE_EVENT_ID_PREFIX = "mcp-job-recovered-failed-"
 _RECOVERED_INTERRUPTED_EVENT_ID_PREFIX = "mcp-job-recovered-interrupted-"
 _DRAIN_INTERRUPTED_EVENT_ID_PREFIX = "mcp-job-drain-interrupted-"
 _DRAIN_GRACE_SECONDS = 5.0
+_TERMINAL_APPEND_RETRY_DELAY_SECONDS = 0.05
 
 
 def _drain_interrupted_data() -> dict[str, Any]:
@@ -412,116 +414,149 @@ class JobManager:
         at the boundary, so the finally-block here does not need to manage
         coroutine ``close()`` cleanup.
         """
-        await self.update_status(job_id, JobStatus.RUNNING, f"Running {job_type}")
-
+        cancel_context = False
         try:
-            result = await runner
-        except asyncio.CancelledError:
-            snapshot = await self.get_snapshot(job_id)
-            if snapshot.is_terminal:
-                return
-            completed_result = await self._derive_completed_execution_result(snapshot)
-            if completed_result is not None and snapshot.status != JobStatus.CANCEL_REQUESTED:
-                await self._append_execution_completed_event(job_id, completed_result)
-                return
-            if not runner.done():
-                runner.cancel()
-                try:
-                    await runner
-                except asyncio.CancelledError:
-                    pass
-            if self._draining:
-                # Server shutdown, not a user cancel: persist INTERRUPTED
-                # (matching the dead-owner reconciliation semantics) — unless a
-                # live external holder owns the terminal state for this job.
-                if self._drain_should_terminalize(snapshot):
-                    await self._append_event(
-                        "mcp.job.interrupted",
+            await self.update_status(job_id, JobStatus.RUNNING, f"Running {job_type}")
+
+            try:
+                result = await runner
+            except asyncio.CancelledError:
+                cancel_context = True
+                snapshot = await self.get_snapshot(job_id)
+                if snapshot.is_terminal:
+                    return
+                completed_result = await self._derive_completed_execution_result(snapshot)
+                if completed_result is not None and snapshot.status != JobStatus.CANCEL_REQUESTED:
+                    await self._append_execution_completed_event_with_fallback(
                         job_id,
-                        _drain_interrupted_data(),
-                        event_id=f"{_DRAIN_INTERRUPTED_EVENT_ID_PREFIX}{job_id}",
+                        completed_result,
                     )
+                    return
+                if not runner.done():
+                    runner.cancel()
+                    try:
+                        await runner
+                    except asyncio.CancelledError:
+                        pass
+                if self._draining:
+                    # Server shutdown, not a user cancel: persist INTERRUPTED
+                    # (matching the dead-owner reconciliation semantics) — unless a
+                    # live external holder owns the terminal state for this job.
+                    if self._drain_should_terminalize(snapshot):
+                        await self._append_terminal_event_with_fallback(
+                            "mcp.job.interrupted",
+                            job_id,
+                            _drain_interrupted_data(),
+                            event_id=f"{_DRAIN_INTERRUPTED_EVENT_ID_PREFIX}{job_id}",
+                        )
+                    raise
+                await self._append_terminal_event_with_fallback(
+                    "mcp.job.cancelled",
+                    job_id,
+                    {
+                        "status": JobStatus.CANCELLED.value,
+                        "message": "Job cancelled",
+                    },
+                )
                 raise
-            await self._append_event(
-                "mcp.job.cancelled",
-                job_id,
-                {
-                    "status": JobStatus.CANCELLED.value,
-                    "message": "Job cancelled",
-                },
-            )
-            raise
-        except Exception as exc:
-            snapshot = await self.get_snapshot(job_id)
-            if snapshot.is_terminal:
-                return
-            await self._append_event(
-                "mcp.job.failed",
-                job_id,
-                {
-                    "status": JobStatus.FAILED.value,
-                    "message": f"Job failed: {exc}",
-                    "error": str(exc),
-                    "is_error": True,
-                },
-            )
-        else:
-            snapshot = await self.get_snapshot(job_id)
-            if snapshot.is_terminal:
-                return
-            terminal_type = "mcp.job.completed"
-            terminal_status = JobStatus.COMPLETED
-            result_meta = getattr(result, "meta", {})
-            terminal_kind = None
-            if isinstance(result_meta, dict):
-                terminal_kind = result_meta.get("action") or result_meta.get("status")
-            if snapshot.status == JobStatus.CANCEL_REQUESTED:
-                terminal_type = "mcp.job.cancelled"
-                terminal_status = JobStatus.CANCELLED
-            elif terminal_kind == "interrupted":
-                terminal_type = "mcp.job.interrupted"
-                terminal_status = JobStatus.INTERRUPTED
-            elif terminal_kind in {"cancel", "cancelled"}:
-                terminal_type = "mcp.job.cancelled"
-                terminal_status = JobStatus.CANCELLED
-            elif getattr(result, "is_error", False):
-                terminal_type = "mcp.job.failed"
-                terminal_status = JobStatus.FAILED
-            elif job_id in self._monitor_terminalized_jobs:
-                completed_result = await self._derive_completed_execution_result(snapshot)
-                if completed_result is not None:
-                    await self._append_execution_completed_event(
-                        job_id,
-                        completed_result,
-                        result_meta=result_meta if isinstance(result_meta, dict) else None,
-                    )
+            except Exception as exc:
+                snapshot = await self.get_snapshot(job_id)
+                if snapshot.is_terminal:
                     return
+                await self._append_terminal_event_with_fallback(
+                    "mcp.job.failed",
+                    job_id,
+                    {
+                        "status": JobStatus.FAILED.value,
+                        "message": f"Job failed: {exc}",
+                        "error": str(exc),
+                        "is_error": True,
+                    },
+                )
             else:
-                completed_result = await self._derive_completed_execution_result(snapshot)
-                if completed_result is not None:
-                    await self._append_execution_completed_event(
-                        job_id,
-                        completed_result,
-                        result_meta=result_meta if isinstance(result_meta, dict) else None,
-                    )
+                snapshot = await self.get_snapshot(job_id)
+                if snapshot.is_terminal:
                     return
-            await self._append_event(
-                terminal_type,
-                job_id,
-                {
-                    "status": terminal_status.value,
-                    "message": {
-                        JobStatus.COMPLETED: "Job complete",
-                        JobStatus.CANCELLED: "Job cancelled",
-                        JobStatus.INTERRUPTED: "Job interrupted",
-                        JobStatus.FAILED: "Job failed",
-                    }.get(terminal_status, "Job complete"),
-                    "result_text": getattr(result, "text_content", str(result))[:20_000],
-                    "result_meta": _safe_meta(getattr(result, "meta", {})),
-                    "result_payload": _safe_result_payload(result),
-                    "is_error": bool(getattr(result, "is_error", False)),
-                },
-            )
+                terminal_type = "mcp.job.completed"
+                terminal_status = JobStatus.COMPLETED
+                result_meta = getattr(result, "meta", {})
+                terminal_kind = None
+                if isinstance(result_meta, dict):
+                    terminal_kind = result_meta.get("action") or result_meta.get("status")
+                if snapshot.status == JobStatus.CANCEL_REQUESTED:
+                    terminal_type = "mcp.job.cancelled"
+                    terminal_status = JobStatus.CANCELLED
+                elif terminal_kind == "interrupted":
+                    terminal_type = "mcp.job.interrupted"
+                    terminal_status = JobStatus.INTERRUPTED
+                elif terminal_kind in {"cancel", "cancelled"}:
+                    terminal_type = "mcp.job.cancelled"
+                    terminal_status = JobStatus.CANCELLED
+                elif getattr(result, "is_error", False):
+                    terminal_type = "mcp.job.failed"
+                    terminal_status = JobStatus.FAILED
+                elif job_id in self._monitor_terminalized_jobs:
+                    completed_result = await self._derive_completed_execution_result(snapshot)
+                    if completed_result is not None:
+                        await self._append_execution_completed_event_with_fallback(
+                            job_id,
+                            completed_result,
+                            result_meta=result_meta if isinstance(result_meta, dict) else None,
+                        )
+                        return
+                else:
+                    completed_result = await self._derive_completed_execution_result(snapshot)
+                    if completed_result is not None:
+                        await self._append_execution_completed_event_with_fallback(
+                            job_id,
+                            completed_result,
+                            result_meta=result_meta if isinstance(result_meta, dict) else None,
+                        )
+                        return
+                await self._append_terminal_event_with_fallback(
+                    terminal_type,
+                    job_id,
+                    {
+                        "status": terminal_status.value,
+                        "message": {
+                            JobStatus.COMPLETED: "Job complete",
+                            JobStatus.CANCELLED: "Job cancelled",
+                            JobStatus.INTERRUPTED: "Job interrupted",
+                            JobStatus.FAILED: "Job failed",
+                        }.get(terminal_status, "Job complete"),
+                        "result_text": getattr(result, "text_content", str(result))[:20_000],
+                        "result_meta": _safe_meta(getattr(result, "meta", {})),
+                        "result_payload": _safe_result_payload(result),
+                        "is_error": bool(getattr(result, "is_error", False)),
+                    },
+                )
+        except asyncio.CancelledError:
+            # Cancellation can strike the terminal-writing logic itself (e.g. a
+            # second cancel landing on the get_snapshot await inside the inner
+            # CancelledError handler); make sure SOME terminal state is durably
+            # persisted before propagating — with cancel/drain semantics, not
+            # FAILED.
+            guard_status = await self._terminal_guard_status(job_id, cancel_context=True)
+            if guard_status is not None:
+                await self._ensure_terminal_event_best_effort(
+                    job_id,
+                    reason="job task cancelled during terminalization",
+                    terminal_status=guard_status,
+                )
+            raise
+        except BaseException as exc:
+            # The terminal-writing logic itself crashed before persisting any
+            # terminal event (e.g. a transient store error out of
+            # get_snapshot/derivation, NOT the append — those already have
+            # their own fallback). Without this a job stays RUNNING forever.
+            guard_status = await self._terminal_guard_status(job_id, cancel_context=cancel_context)
+            if guard_status is not None:
+                await self._ensure_terminal_event_best_effort(
+                    job_id,
+                    reason=f"terminalization failed: {exc}",
+                    terminal_status=guard_status,
+                )
+            raise
         finally:
             self._tasks.pop(job_id, None)
             self._runner_tasks.pop(job_id, None)
@@ -689,6 +724,203 @@ class JobManager:
             event_id=event_id,
         )
         return True
+
+    async def _append_execution_completed_event_with_fallback(
+        self,
+        job_id: str,
+        result_text: str,
+        *,
+        session_id: str | None = None,
+        result_meta: dict[str, Any] | None = None,
+    ) -> bool:
+        """Persist execution-derived completion, falling back to FAILED on append errors."""
+        try:
+            return await self._append_execution_completed_event(
+                job_id,
+                result_text,
+                session_id=session_id,
+                result_meta=result_meta,
+            )
+        except Exception as exc:
+            await self._append_terminal_fallback_event(
+                job_id,
+                original_event_type="mcp.job.completed",
+                original_data={
+                    "status": JobStatus.COMPLETED.value,
+                    "message": "Execution complete; formal evaluation not run",
+                    "result_text": result_text,
+                    "result_meta": result_meta or {},
+                    "is_error": False,
+                },
+                append_error=exc,
+                retry_append=lambda: self._append_execution_completed_event(
+                    job_id,
+                    result_text,
+                    session_id=session_id,
+                    result_meta=result_meta,
+                ),
+            )
+            return True
+
+    async def _append_terminal_event_with_fallback(
+        self,
+        event_type: str,
+        job_id: str,
+        data: dict[str, Any],
+        *,
+        event_id: str | None = None,
+    ) -> None:
+        """Persist a terminal job event, falling back to FAILED if persistence fails."""
+        try:
+            await self._append_event(event_type, job_id, data, event_id=event_id)
+        except Exception as exc:
+            await self._append_terminal_fallback_event(
+                job_id,
+                original_event_type=event_type,
+                original_data=data,
+                append_error=exc,
+                retry_append=lambda: self._append_event(
+                    event_type, job_id, data, event_id=event_id
+                ),
+            )
+
+    async def _terminal_guard_status(
+        self, job_id: str, *, cancel_context: bool
+    ) -> JobStatus | None:
+        """Pick the last-resort terminal status for a crashed/cancelled _run_job.
+
+        Returns ``None`` when the job must NOT be terminalized here — during a
+        drain whose live external holder owns the terminal state (matching
+        ``_drain_should_terminalize``), including when that check itself cannot
+        be evaluated (dead-owner reconciliation recovers such jobs at startup).
+        """
+        if self._draining:
+            try:
+                snapshot = await self.get_snapshot(job_id)
+            except Exception:
+                return None
+            if not self._drain_should_terminalize(snapshot):
+                return None
+            return JobStatus.INTERRUPTED
+        if cancel_context:
+            return JobStatus.CANCELLED
+        return JobStatus.FAILED
+
+    async def _ensure_terminal_event_best_effort(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        terminal_status: JobStatus = JobStatus.FAILED,
+    ) -> None:
+        """Last-resort guarantee that a job never stays RUNNING forever.
+
+        Called when the terminal-writing logic in ``_run_job`` itself failed or
+        was cancelled. If a terminal event already exists this is a no-op;
+        otherwise persist a diagnostic terminal event. Never raises.
+        """
+        event_type = {
+            JobStatus.CANCELLED: "mcp.job.cancelled",
+            JobStatus.INTERRUPTED: "mcp.job.interrupted",
+        }.get(terminal_status, "mcp.job.failed")
+        try:
+            if await self._job_has_persisted_terminal_event(job_id):
+                return
+            await self._append_event(
+                event_type,
+                job_id,
+                {
+                    "status": terminal_status.value,
+                    "message": "Job terminalized by last-resort guard",
+                    "error": reason,
+                    "result_text": reason,
+                    "result_meta": {"terminal_append_failed": True, "ensure_reason": reason},
+                    "is_error": terminal_status is JobStatus.FAILED,
+                },
+            )
+        except Exception:
+            logger.error(
+                "mcp.job.ensure_terminal_failed",
+                extra={"job_id": job_id},
+                exc_info=True,
+            )
+
+    async def _job_has_persisted_terminal_event(self, job_id: str) -> bool:
+        """Best-effort check whether a terminal event already exists for a job."""
+        try:
+            events, _cursor = await self._event_store.get_events_after("job", job_id, last_row_id=0)
+        except Exception:
+            return False
+        return _latest_job_terminal_event(events) is not None
+
+    async def _append_terminal_fallback_event(
+        self,
+        job_id: str,
+        *,
+        original_event_type: str,
+        original_data: dict[str, Any],
+        append_error: Exception,
+        retry_append: Callable[[], Awaitable[Any]] | None = None,
+    ) -> None:
+        """Best-effort FAILED event when the intended terminal append fails."""
+        logger.warning(
+            "mcp.job.terminal_append_failed",
+            extra={
+                "job_id": job_id,
+                "original_event_type": original_event_type,
+            },
+            exc_info=True,
+        )
+        # EventStore.append only retries "database is locked"; other transient
+        # errors deserve one re-attempt of the ORIGINAL event before we durably
+        # downgrade the job's true terminal state to FAILED.
+        await asyncio.sleep(_TERMINAL_APPEND_RETRY_DELAY_SECONDS)
+        if await self._job_has_persisted_terminal_event(job_id):
+            # A concurrent writer (recovery, monitor) already terminalized the
+            # job; snapshot projection is latest-wins, so writing the FAILED
+            # fallback now would overwrite a truthful terminal state.
+            return
+        if retry_append is not None:
+            try:
+                await retry_append()
+            except Exception:
+                logger.warning(
+                    "mcp.job.terminal_append_retry_failed",
+                    extra={
+                        "job_id": job_id,
+                        "original_event_type": original_event_type,
+                    },
+                    exc_info=True,
+                )
+            else:
+                return
+            if await self._job_has_persisted_terminal_event(job_id):
+                return
+        error = f"Failed to append terminal event {original_event_type}: {append_error}"
+        fallback_data = {
+            "status": JobStatus.FAILED.value,
+            "message": "Job failed while persisting terminal state",
+            "error": error,
+            "result_text": error,
+            "result_meta": {
+                "terminal_append_failed": True,
+                "original_event_type": original_event_type,
+                "original_status": original_data.get("status"),
+                "original_message": original_data.get("message"),
+            },
+            "is_error": True,
+        }
+        try:
+            await self._append_event("mcp.job.failed", job_id, fallback_data)
+        except Exception:
+            logger.error(
+                "mcp.job.terminal_fallback_append_failed",
+                extra={
+                    "job_id": job_id,
+                    "original_event_type": original_event_type,
+                },
+                exc_info=True,
+            )
 
     async def _append_progress_accounting_failed_event(
         self,

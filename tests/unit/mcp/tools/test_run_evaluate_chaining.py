@@ -8,6 +8,8 @@ byte-for-byte at the metadata boundary.
 from __future__ import annotations
 
 import asyncio
+import faulthandler
+import tempfile
 import time
 from typing import Any
 
@@ -53,7 +55,48 @@ async def _wait_terminal(job_manager: JobManager, job_id: str) -> JobSnapshot:
                 pass
         else:
             await asyncio.sleep(0.01)
-    raise AssertionError(f"job {job_id} did not reach a terminal state")
+    diagnostics = _diagnose_stuck_job(job_manager, job_id)
+    try:
+        events, cursor = await job_manager._event_store.get_events_after("job", job_id, 0)
+        stream = "\n".join(
+            f"  {e.timestamp} {e.type} id={e.id} status={e.data.get('status')}" for e in events
+        )
+        diagnostics += f"\npersisted job events (cursor={cursor}):\n{stream or '  <empty stream>'}"
+    except Exception as exc:
+        diagnostics += f"\n<event stream unavailable: {exc!r}>"
+    raise AssertionError(f"job {job_id} did not reach a terminal state\n{diagnostics}")
+
+
+def _diagnose_stuck_job(job_manager: JobManager, job_id: str) -> str:
+    """Capture where every task/thread is stuck when the job never terminalizes.
+
+    This failure is CI-only (issue #1566) and has never reproduced locally, so
+    the assertion message is the only diagnostic channel we get: dump the job
+    task states plus every asyncio task stack and native thread stack.
+    """
+    lines: list[str] = ["--- stuck-job diagnostics (#1566) ---"]
+    task = job_manager._tasks.get(job_id)
+    runner = job_manager._runner_tasks.get(job_id)
+    lines.append(f"job task: {task!r}")
+    lines.append(f"runner task: {runner!r}")
+    for t in asyncio.all_tasks():
+        frames = t.get_stack(limit=6)
+        where = " <- ".join(
+            f"{f.f_code.co_name}:{f.f_code.co_filename.rsplit('/', 1)[-1]}:{f.f_lineno}"
+            for f in reversed(frames)
+        )
+        lines.append(f"asyncio task {t.get_name()} done={t.done()}: {where or '<no stack>'}")
+    # faulthandler needs a real file descriptor (StringIO raises
+    # io.UnsupportedOperation: fileno), so dump native thread stacks to a
+    # temp file and read them back into the assertion message.
+    try:
+        with tempfile.TemporaryFile(mode="w+") as buf:
+            faulthandler.dump_traceback(file=buf)
+            buf.seek(0)
+            lines.append(buf.read())
+    except Exception as exc:  # diagnostics must never mask the real failure
+        lines.append(f"<faulthandler dump unavailable: {exc!r}>")
+    return "\n".join(lines)
 
 
 async def _wait_for_call(calls: list[Any]) -> None:
