@@ -46,7 +46,7 @@ from ouroboros.core.execution_preferences import (
     execution_preferences_from_contract,
     resolve_execution_preferences,
 )
-from ouroboros.core.seed import ac_text, ac_texts
+from ouroboros.core.seed import AcceptanceCriterionSpec, ac_text, ac_texts
 from ouroboros.core.seed_contract import SeedContract
 from ouroboros.core.seed_contract_prompt import (
     render_auto_recursion_guard,
@@ -313,6 +313,14 @@ def _strategy_for_seed(seed: Seed, *, fat_harness_mode: bool = False) -> Executi
         if profile is not None:
             return ProfileBackedStrategy(profile)
     return get_strategy(seed.task_type)
+
+
+def _seed_has_investment_metadata(seed: Seed) -> bool:
+    """Return whether any AC requires per-criterion investment routing."""
+    return any(
+        isinstance(criterion, AcceptanceCriterionSpec) and criterion.investment is not None
+        for criterion in seed.acceptance_criteria
+    )
 
 
 def build_system_prompt(
@@ -920,13 +928,16 @@ class OrchestratorRunner:
     ) -> dict[str, str]:
         """Lay the runner's own execute_task paths on BOTH investment contracts.
 
-        These direct paths (single-AC execution, resume) do not go through
-        ParallelACExecutor, so without this they would silently skip effort AND
-        model-tier routing. Returns the merged execute_task kwargs (empty unless
-        the runtime enforces the respective parameter).
+        These legacy direct paths do not go through ParallelACExecutor, so without
+        this they would silently skip effort AND model-tier routing. Seeds carrying
+        AC investment metadata are routed through the AC executor instead, and
+        resume fails closed until it can restore per-AC authority. Returns the
+        merged execute_task kwargs (empty unless the runtime enforces the respective
+        parameter).
 
-        It also records an ``execution.ac.effort_routed`` event (and, when a model
-        is decided, an ``execution.ac.model_routed`` event) for OBSERVABILITY — so
+        It records ``execution.ac.investment_assessed`` plus the applicable
+        ``execution.ac.effort_routed`` and ``execution.ac.model_routed`` events for
+        OBSERVABILITY — so
         a direct run's routing is visible in the event stream exactly like the
         parallel path's. These events are deliberately NOT a frugality-proof
         contribution: a direct run is a single top-level unit
@@ -938,25 +949,49 @@ class OrchestratorRunner:
         direct call has nothing to say about. ``call_site="runner"`` marks the
         origin so the two emission paths are distinguishable in the stream.
         """
-        from ouroboros.orchestrator.effort_routing import resolve_execute_effort
+        from ouroboros.orchestrator.effort_routing import assess_investment, resolve_execute_effort
         from ouroboros.orchestrator.model_routing import resolve_execute_model
 
+        investment_assessment = assess_investment(None)
         decision, kwargs = resolve_execute_effort(
             self._adapter,
             base_effort=self._reasoning_effort,
             is_decomposed_child=False,
+            investment_assessment=investment_assessment,
         )
         model_decision, model_kwargs = resolve_execute_model(
             self._adapter,
             router=self._model_router,
             is_decomposed_child=False,
+            decomposition_trustworthy=False,
         )
         # Merge the model override; kwargs carry a parameter ONLY for runtimes that
         # enforce it, so an advised runtime is never handed one.
         kwargs = {**kwargs, **model_kwargs}
-        if decision.level is not None:
-            from ouroboros.events.base import BaseEvent
+        from ouroboros.events.base import BaseEvent
 
+        try:
+            await self._event_store.append(
+                BaseEvent(
+                    type="execution.ac.investment_assessed",
+                    aggregate_type="execution",
+                    aggregate_id=execution_id or session_id or "",
+                    data={
+                        "execution_id": execution_id,
+                        "session_id": session_id,
+                        "is_decomposed_child": False,
+                        **investment_assessment.to_event_data(),
+                        "runtime_backend": getattr(self._adapter, "runtime_backend", None),
+                        "call_site": "runner",
+                    },
+                )
+            )
+        except Exception as exc:
+            log.warning(
+                "orchestrator.runner.investment_assessed.persist_failed",
+                error=str(exc),
+            )
+        if decision.level is not None:
             # Observability-only: this event must never make runtime dispatch/resume
             # depend on event-store health. _route_call_effort runs BEFORE
             # execute_task on the direct and resume paths, so a raw append would turn
@@ -976,6 +1011,7 @@ class OrchestratorRunner:
                             "effort_mode": decision.mode,
                             "base_reasoning_effort": self._reasoning_effort,
                             "runtime_backend": getattr(self._adapter, "runtime_backend", None),
+                            "investment_assessment": investment_assessment.to_event_data(),
                             "call_site": "runner",
                         },
                     )
@@ -988,8 +1024,6 @@ class OrchestratorRunner:
                     effort_mode=decision.mode,
                 )
         if model_decision.model is not None:
-            from ouroboros.events.base import BaseEvent
-
             # Same observe-only contract as the effort event above: a degraded
             # event store must degrade to a warning, never fail dispatch/resume.
             try:
@@ -1002,6 +1036,8 @@ class OrchestratorRunner:
                             "execution_id": execution_id,
                             "session_id": session_id,
                             "is_decomposed_child": False,
+                            "decomposition_trustworthy": False,
+                            "child_downgrade_authorized": False,
                             "model_tier": model_decision.tier,
                             "model": model_decision.model,
                             "model_mode": model_decision.mode,
@@ -4093,10 +4129,14 @@ class OrchestratorRunner:
 
             # Check for fat-harness / parallel execution mode. Fat-harness
             # uses the AC executor even for single-AC or --sequential runs so
-            # the evidence gate is never silently bypassed.
+            # the evidence gate is never silently bypassed. Investment metadata
+            # likewise requires per-AC dispatch so direct whole-seed execution
+            # cannot discard difficulty/stakes authority.
+            has_investment_metadata = _seed_has_investment_metadata(seed)
             if (
                 self._fat_harness_mode
                 or force_sequential_levels
+                or has_investment_metadata
                 or (parallel and len(seed.acceptance_criteria) > 1)
             ):
                 parallel_kwargs: dict[str, Any] = {
@@ -4110,7 +4150,9 @@ class OrchestratorRunner:
                 }
                 if externally_satisfied_acs:
                     parallel_kwargs["externally_satisfied_acs"] = externally_satisfied_acs
-                if force_sequential_levels or (self._fat_harness_mode and not parallel):
+                if force_sequential_levels or (
+                    not parallel and (self._fat_harness_mode or has_investment_metadata)
+                ):
                     parallel_kwargs["force_sequential_levels"] = True
 
                 return await self._execute_parallel(**parallel_kwargs)
@@ -5091,6 +5133,28 @@ class OrchestratorRunner:
                         "execution_id": tracker.execution_id,
                         "fat_harness_mode": True,
                         "resume_blocked": "typed_evidence_gate_required",
+                    },
+                )
+            )
+
+        if _seed_has_investment_metadata(seed):
+            self._cleanup_pre_execution_state(
+                tracker.execution_id,
+                session_id,
+                session_registered=False,
+            )
+            return Result.err(
+                OrchestratorError(
+                    message=(
+                        "Resume is blocked because this resume path cannot preserve "
+                        "per-AC investment authority; restart the run so each AC goes "
+                        "through the investment-aware AC executor."
+                    ),
+                    details={
+                        "session_id": session_id,
+                        "execution_id": tracker.execution_id,
+                        "investment_metadata_present": True,
+                        "resume_blocked": "investment_authority_required",
                     },
                 )
             )

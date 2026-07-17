@@ -373,7 +373,7 @@ def build_model_router(
         return None
 
     # Activates the previously-unconsumed ``default_tier`` field: the shipped
-    # default "frugal" makes decomposed children run haiku.
+    # default "frugal" is the floor for explicitly trusted decomposed children.
     child_tier = economics.default_tier
     # Top-level ACs sit one notch above the child tier, so with the shipped
     # default they keep today's sonnet — zero behavior regression at the top.

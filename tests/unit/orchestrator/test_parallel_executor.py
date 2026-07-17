@@ -14,6 +14,7 @@ import pytest
 
 from ouroboros.core.seed import (
     AcceptanceCriterionSpec,
+    InvestmentSpec,
     OntologySchema,
     Seed,
     SeedMetadata,
@@ -165,7 +166,7 @@ class TestDispatchRateGate:
         assert slept == [60.0]  # second dispatch waited a full window
 
 
-def _make_seed(*acceptance_criteria: str) -> Seed:
+def _make_seed(*acceptance_criteria: str | AcceptanceCriterionSpec) -> Seed:
     """Build a minimal seed for parallel executor tests."""
     return Seed(
         goal="Implement staged AC execution",
@@ -8949,7 +8950,17 @@ class TestParallelACExecutor:
         """
         from ouroboros.orchestrator import cross_harness_redispatch as chr
 
-        seed = _make_seed("AC 0 flow")
+        investment = InvestmentSpec(
+            difficulty="high",
+            stakes="high",
+            provenance="declared",
+            confidence="high",
+        )
+        ac_spec = AcceptanceCriterionSpec(
+            description="AC 0 flow",
+            investment=investment,
+        )
+        seed = _make_seed(ac_spec)
         executor = ParallelACExecutor(
             adapter=MagicMock(),
             event_store=AsyncMock(),
@@ -8971,7 +8982,7 @@ class TestParallelACExecutor:
             return [
                 ACExecutionResult(
                     ac_index=idx,
-                    ac_content=seed.acceptance_criteria[idx],
+                    ac_content="AC 0 flow",
                     success=False,
                     error="fabricated claim",
                     outcome=ACExecutionOutcome.FAILED,
@@ -8983,9 +8994,11 @@ class TestParallelACExecutor:
         executor._execute_ac_batch = fake_batch  # type: ignore[method-assign]
 
         alt_backends: list[str] = []
+        alternate_rerun_kwargs: list[dict[str, Any]] = []
 
         async def fake_run_single(backend: str, **kwargs: Any) -> ACExecutionResult:
             alt_backends.append(backend)
+            alternate_rerun_kwargs.append(kwargs["rerun_kwargs"])
             return ACExecutionResult(
                 ac_index=0,
                 ac_content="AC 0 flow",
@@ -9012,6 +9025,10 @@ class TestParallelACExecutor:
         # Early-stop fired after retry 1 (initial FAB + retry-1 FAB), before the
         # counter cap — yet the alternate harness was still consulted exactly once.
         assert alt_backends == ["codex"]
+        assert alternate_rerun_kwargs[0]["ac_spec"] == seed.acceptance_criteria[0]
+        assert alternate_rerun_kwargs[0]["ac_spec"].semantic_ac_key is not None
+        assert alternate_rerun_kwargs[0]["investment_spec"] is investment
+        assert alternate_rerun_kwargs[0]["decomposition_trustworthy"] is False
         # The failed alternate is surfaced as the authoritative result.
         assert isinstance(results[0], ACExecutionResult)
         assert results[0].success is False

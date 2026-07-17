@@ -42,7 +42,12 @@ from typing import TYPE_CHECKING, Any, Literal
 import anyio
 from rich.console import Console
 
-from ouroboros.core.seed import AcceptanceCriterionSpec, ac_text, derive_semantic_ac_key
+from ouroboros.core.seed import (
+    AcceptanceCriterionSpec,
+    InvestmentSpec,
+    ac_text,
+    derive_semantic_ac_key,
+)
 from ouroboros.core.session_signal import (
     SessionSignalMode,
     bounded_session_signal_reply,
@@ -102,7 +107,7 @@ from ouroboros.orchestrator.decomposition_policy import (
     summarize_decomposition_trace,
     validate_decomposition_proposal,
 )
-from ouroboros.orchestrator.effort_routing import resolve_execute_effort
+from ouroboros.orchestrator.effort_routing import assess_investment, resolve_execute_effort
 from ouroboros.orchestrator.events import create_ac_stall_detected_event
 from ouroboros.orchestrator.evidence.ac_classification import (  # noqa: F401
     _CODE_IMPLEMENTATION_ACTION_RE,
@@ -955,10 +960,9 @@ class ParallelACExecutor:
         self._run_verify_commands = run_verify_commands
         self._verify_command_timeout_seconds = max(1, verify_command_timeout_seconds)
         self._ac_retry_attempts = max(0, ac_retry_attempts)
-        # Effort-first investment dial (RFC #1405). Base level for full-strength
-        # units; decomposed children run one notch lower. ``None`` leaves effort
-        # routing dormant (execute_task receives no level → no behavior change),
-        # so laying the executor on the capability contract is safe by default.
+        # Effort-first investment dial (RFC #1405). AC investment metadata may
+        # impose a floor or authorize one lower notch; decomposition alone never
+        # lowers effort. ``None`` leaves effort routing dormant.
         self._reasoning_effort = reasoning_effort
         # Model-tier investment dial (the frugality sibling of reasoning_effort).
         # The router maps a per-unit tier decision to a backend-executable model id;
@@ -1578,6 +1582,11 @@ class ParallelACExecutor:
                         same_runtime_budget_exhausted=same_runtime_budget_exhausted,
                         ac_spec=(
                             ac_criterion
+                            if isinstance(ac_criterion, AcceptanceCriterionSpec)
+                            else None
+                        ),
+                        investment_spec=(
+                            ac_criterion.investment
                             if isinstance(ac_criterion, AcceptanceCriterionSpec)
                             else None
                         ),
@@ -2437,6 +2446,7 @@ class ParallelACExecutor:
         node_identity: ExecutionNodeIdentity,
         start_time: datetime,
         semantic_ac_key: str,
+        investment_spec: InvestmentSpec | None = None,
     ) -> ACExecutionResult:
         """Dispatch one finalized split through the shared recursive child path."""
         sub_acs = [child.description for child in decision.children]
@@ -2495,6 +2505,7 @@ class ParallelACExecutor:
                     parent_ac_index=legacy_parent_ac_index,
                     sub_ac_index=legacy_sub_ac_index,
                     node_identity=child_node_identity,
+                    investment_spec=investment_spec,
                     decomposition_trustworthy=decision.trustworthy,
                     semantic_ac_key=semantic_ac_key,
                 )
@@ -2786,6 +2797,7 @@ class ParallelACExecutor:
         ac_spec: AcceptanceCriterionSpec | None,
         start_time: datetime,
         semantic_ac_key: str,
+        investment_spec: InvestmentSpec | None = None,
     ) -> tuple[ACExecutionResult | None, DecompositionDecisionRecord | None]:
         """Run cause-matched bounce recovery before alternate-harness fallback."""
         if self._decomposition_mode != "bounce_only" or result.success:
@@ -2884,6 +2896,7 @@ class ParallelACExecutor:
                 node_identity=node_identity,
                 start_time=start_time,
                 semantic_ac_key=semantic_ac_key,
+                investment_spec=investment_spec,
             )
             return recovered, decision
         return None, decision
@@ -2910,6 +2923,7 @@ class ParallelACExecutor:
         retry_prompt_extra: str = "",
         same_runtime_budget_exhausted: bool = True,
         ac_spec: AcceptanceCriterionSpec | None = None,
+        investment_spec: InvestmentSpec | None = None,
         decomposition_trustworthy: bool = False,
         semantic_ac_key: str | None = None,
     ) -> ACExecutionResult:
@@ -2942,6 +2956,13 @@ class ParallelACExecutor:
                 contract, so the atomic leaf prompt can surface it. Only the batch
                 layer passes it for top-level ACs; sub-AC recursion leaves it
                 ``None`` (a decomposed child has no spec-level contract of its own).
+            investment_spec: The top-level AC's investment authority. Recursive
+                children inherit it because they jointly discharge the parent AC.
+                This is separate from ``ac_spec`` so the parent's success contract
+                is not copied into child prompts.
+            decomposition_trustworthy: Explicit deterministic trust for this unit's
+                decomposition. Defaults fail closed; current live decomposition has
+                no trusted producer.
 
         Returns:
             ACExecutionResult for this AC.
@@ -3030,6 +3051,7 @@ class ParallelACExecutor:
                 node_identity=node_identity,
                 start_time=start_time,
                 semantic_ac_key=semantic_ac_key,
+                investment_spec=investment_spec,
             )
 
         if (
@@ -3088,6 +3110,7 @@ class ParallelACExecutor:
             "sub_ac_index": sub_ac_index,
             "node_identity": node_identity,
             "ac_spec": ac_spec,
+            "investment_spec": investment_spec,
             "decomposition_trustworthy": decomposition_trustworthy,
             "semantic_ac_key": semantic_ac_key,
         }
@@ -3113,6 +3136,7 @@ class ParallelACExecutor:
                 sub_ac_index=sub_ac_index,
                 node_identity=node_identity,
                 ac_spec=ac_spec,
+                investment_spec=investment_spec,
                 decomposition_trustworthy=decomposition_trustworthy,
                 semantic_ac_key=semantic_ac_key,
             )
@@ -3139,6 +3163,7 @@ class ParallelACExecutor:
                         ac_spec=ac_spec,
                         start_time=start_time,
                         semantic_ac_key=semantic_ac_key,
+                        investment_spec=investment_spec,
                     )
                     if bounce_decision is not None:
                         node_decision = bounce_decision
@@ -3218,6 +3243,7 @@ class ParallelACExecutor:
                     ac_spec=ac_spec,
                     start_time=start_time,
                     semantic_ac_key=semantic_ac_key,
+                    investment_spec=investment_spec,
                 )
                 if bounce_decision is not None:
                     node_decision = bounce_decision
@@ -4172,6 +4198,7 @@ Respond with either ATOMIC or the structured JSON object only.
         execution_counters: dict[str, int] | None = None,
         retry_prompt_extra: str = "",
         ac_spec: AcceptanceCriterionSpec | None = None,
+        investment_spec: InvestmentSpec | None = None,
         decomposition_trustworthy: bool = False,
         semantic_ac_key: str | None = None,
     ) -> ACExecutionResult:
@@ -4261,6 +4288,17 @@ Respond with either ATOMIC or the structured JSON object only.
         # an RPM/TPM is configured for this backend) before the stall-scoped run.
         await self._await_dispatch_rate_budget(prompt=prompt, system_prompt=system_prompt)
 
+        investment_assessment = assess_investment(investment_spec)
+        await self._event_emitter.emit_investment_assessed(
+            runtime_identity=runtime_identity,
+            execution_id=execution_context_id,
+            session_id=session_id,
+            ac_index=ac_index,
+            is_sub_ac=is_sub_ac,
+            assessment=investment_assessment.to_event_data(),
+            runtime_backend=getattr(self._adapter, "runtime_backend", None),
+        )
+
         # Lay the executor on the capability contract: decide the effort level for
         # this unit (a decomposed child inherits the parent tier unchanged; a hard AC
         # on its second-or-later retry is raised one notch) and classify how the
@@ -4272,6 +4310,7 @@ Respond with either ATOMIC or the structured JSON object only.
             base_effort=self._reasoning_effort,
             is_decomposed_child=is_sub_ac,
             retry_attempt=retry_attempt,
+            investment_assessment=investment_assessment,
         )
         if effort_decision.level is not None:
             log.debug(
@@ -4304,15 +4343,15 @@ Respond with either ATOMIC or the structured JSON object only.
                 effort_mode=effort_decision.mode,
                 base_reasoning_effort=self._reasoning_effort,
                 runtime_backend=getattr(self._adapter, "runtime_backend", None),
+                investment_assessment=investment_assessment.to_event_data(),
             )
         # execute_effort_kwargs (from resolve_execute_effort) carries
         # reasoning_effort ONLY for runtimes that enforce it; advised runtimes that
         # do not accept the parameter are never handed it.
 
         # Sibling of the effort routing above: decide WHICH model tier runs this
-        # unit (a decomposed child drops one tier cheaper; a hard AC on its
-        # escalation retry is raised one notch) and classify how the chosen runtime
-        # will honor it — enforced via a native per-call override, or merely advised.
+        # unit. A decomposed child drops one tier only with explicit trust; current
+        # live decomposition supplies none. Retry escalation is applied afterward.
         # A profile's suggested_model_tier seeds the starting tier ONLY when it is
         # something other than the shipped default MEDIUM ("no opinion"); MEDIUM
         # leaves precedence with the router's own base/child logic and any explicit
@@ -4368,6 +4407,7 @@ Respond with either ATOMIC or the structured JSON object only.
                 model_mode=model_decision.mode,
                 retry_attempt=retry_attempt,
                 runtime_backend=getattr(self._adapter, "runtime_backend", None),
+                decomposition_trustworthy=decomposition_trustworthy,
                 semantic_ac_key=semantic_ac_key,
                 base_model_tier=(
                     self._model_router.base_tier if self._model_router is not None else None
@@ -5759,10 +5799,7 @@ Respond with either ATOMIC or the structured JSON object only.
                     # Ladder-truth escalation probe. The arithmetic proxy
                     # ``ac_retry_attempts[ac_idx] < escalation_threshold`` only
                     # defeats early-stop for the SINGLE threshold crossing, which is
-                    # correct for a top-level unit (base tier tops out at the
-                    # frontier ceiling exactly at that crossing) but wrong for a
-                    # decomposed child: it starts one tier cheaper, so its ladder
-                    # tops out one retry PAST the threshold. Instead, ask the router
+                    # correct only for one fixed ladder shape. Ask the router
                     # directly whether the NEXT scheduled retry resolves to a
                     # DIFFERENT enforced model than the one just dispatched. This is
                     # agnostic to the unit's start tier and ladder shape: escalation
@@ -5840,9 +5877,8 @@ Respond with either ATOMIC or the structured JSON object only.
                             retry_attempt=ac_retry_attempts[ac_idx],
                         )
                         if isinstance(alt, ACExecutionResult):
-                            # The alternate ran via _execute_single_ac, which has
-                            # no seed-level success contract — apply the same V1
-                            # verify gate the same-runtime results get, so an
+                            # Apply the same V1 verify gate the same-runtime results
+                            # get, so an
                             # alternate 'success' with a failing verify_command or
                             # missing expected artifact is not accepted as success.
                             finalized_alt = await self._apply_verify_gate(
@@ -5909,9 +5945,10 @@ Respond with either ATOMIC or the structured JSON object only.
         the one-per-AC cap, and the failed-alt surfacing all stay in one place.
         """
         execution_context_id = execution_id or session_id
+        ac_criterion = seed.acceptance_criteria[ac_idx]
         rerun_kwargs: dict[str, Any] = {
             "ac_index": ac_idx,
-            "ac_content": ac_text(seed.acceptance_criteria[ac_idx]),
+            "ac_content": ac_text(ac_criterion),
             "session_id": session_id,
             "tools": tools,
             "tool_catalog": tool_catalog,
@@ -5926,6 +5963,15 @@ Respond with either ATOMIC or the structured JSON object only.
             "parent_ac_index": None,
             "sub_ac_index": None,
             "node_identity": None,
+            "ac_spec": (
+                ac_criterion if isinstance(ac_criterion, AcceptanceCriterionSpec) else None
+            ),
+            "investment_spec": (
+                ac_criterion.investment
+                if isinstance(ac_criterion, AcceptanceCriterionSpec)
+                else None
+            ),
+            "decomposition_trustworthy": False,
         }
         return await self._maybe_redispatch_alt_harness(
             result=result,

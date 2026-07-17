@@ -32,6 +32,7 @@ from ouroboros.orchestrator.adapter import (
     FULL_CAPABILITIES,
     AgentMessage,
     ParamSupport,
+    RuntimeCapabilities,
     RuntimeHandle,
 )
 from ouroboros.orchestrator.model_routing import ModelRouter, build_model_router
@@ -223,6 +224,8 @@ class TestExecutorModelWiring:
         assert routed[0].data["model_tier"] == "standard"
         assert routed[0].data["model"] == "sonnet-x"
         assert routed[0].data["is_decomposed_child"] is True
+        assert routed[0].data["decomposition_trustworthy"] is False
+        assert routed[0].data["child_downgrade_authorized"] is False
         assert runtime.received_model == "sonnet-x"
 
     @pytest.mark.asyncio
@@ -242,6 +245,8 @@ class TestExecutorModelWiring:
         routed = _model_events(events)
         assert routed[0].data["model_tier"] == "frugal"
         assert routed[0].data["model"] == "haiku-x"
+        assert routed[0].data["decomposition_trustworthy"] is True
+        assert routed[0].data["child_downgrade_authorized"] is True
         assert runtime.received_model == "haiku-x"
 
     @pytest.mark.asyncio
@@ -361,6 +366,8 @@ class TestModelRoutedEvent:
         assert data["session_id"] == "sess_model"
         assert data["ac_index"] == 1
         assert data["is_decomposed_child"] is False
+        assert data["decomposition_trustworthy"] is False
+        assert data["child_downgrade_authorized"] is False
         assert data["model_tier"] == "standard"
         assert data["model"] == "sonnet-x"
         assert data["model_mode"] == "enforced"
@@ -412,6 +419,33 @@ class TestRunnerRouterConstruction:
         monkeypatch.delenv("OUROBOROS_EXECUTION_MODEL", raising=False)
         runner = self._runner(self._adapter("claude"))
         assert runner._model_router is None
+
+    @pytest.mark.asyncio
+    async def test_direct_runner_model_event_records_fail_closed_trust(self) -> None:
+        adapter = self._adapter("claude")
+        adapter.capabilities = RuntimeCapabilities(
+            skill_dispatch=True,
+            targeted_resume=True,
+            structured_output=True,
+            model_override_support=ParamSupport.NATIVE,
+        )
+        store = AsyncMock()
+        runner = OrchestratorRunner(adapter, store, MagicMock())
+        runner._model_router = _claude_router()
+
+        kwargs = await runner._route_call_effort(
+            execution_id="exec_direct",
+            session_id="sess_direct",
+        )
+
+        assert kwargs["model"] == "sonnet-x"
+        events = [call.args[0] for call in store.append.call_args_list]
+        routed = [event for event in events if event.type == "execution.ac.model_routed"]
+        assert len(routed) == 1
+        assert "ac_id" not in routed[0].data
+        assert routed[0].data["decomposition_trustworthy"] is False
+        assert routed[0].data["child_downgrade_authorized"] is False
+        assert routed[0].data["call_site"] == "runner"
 
     def test_execution_model_pin_env_keeps_router_none(
         self, monkeypatch: pytest.MonkeyPatch
