@@ -2,9 +2,10 @@
 
 ## Status
 
-Proposed implementation slice for Stack 2. This document defines the route
-contract and the pure Admission Kernel. Provider dispatch, bounded escalation,
-and acceptance remain later slices.
+The provider-neutral contract and pure Admission Kernel are implemented. The
+first compatibility projection is now enforced at live direct and parallel
+provider boundaries. Provider execution ownership, bounded escalation policy,
+and Final Gate acceptance remain separate slices.
 
 ## Why this boundary exists
 
@@ -52,9 +53,10 @@ does not make free-form route identities admissible.
 - `enabled`: configuration kill switch;
 - `ordinal`: stable configuration order for the final deterministic tie-break.
 
-Cost and ordinal integers have finite bounds so the contract remains safe for
-ordinary JSON serialization and future fingerprints, including hostile numeric
-inputs.
+Cost preserves the existing public economics contract (`int >= 1`) exactly;
+the projected candidate count remains bounded, and ordinal is a bounded internal
+tie-breaker. This keeps configured costs fingerprint-stable without narrowing
+previously valid economics values.
 
 The serialized contract is intentionally strict: unknown fields, unsupported
 versions, duplicate route IDs, malformed tokens, and an empty registry fail
@@ -111,10 +113,27 @@ provider calls, retry/escalation policy, or Final Gate behavior.
 
 ## Next slices
 
-1. Wire this contract into the existing live model/harness routing path while
-   preserving current behavior behind the explicit compatibility adapter in
-   the next stacked routing layer.
-2. Add bounded observations and escalation in the subsequent stacked routing
-   layer. Escalation may choose the next configured route only after a
-   classified failure and a finite budget.
-3. Emit the route fingerprint into the frugality proof and shared projection.
+1. Add bounded observations and escalation. Escalation may choose the
+   next configured route only after a classified failure and a finite budget.
+2. Emit the route fingerprint into the frugality proof and shared projection.
+
+## Compatibility projection (implemented slice)
+
+`route_compat.py` snapshots the configured economics catalog into a
+`RouteRegistry`. It does not trust the mutable `ModelRouter.tier_models` mapping:
+the mapping must exactly match the normalized provider catalog for the active
+runtime backend, and every candidate carries the configured cost factor. The
+current model/effort decisions are pinned by route ID, model, harness, effort,
+persona, tool policy, and authority identity before a parallel, direct, or
+direct-resume call enters the provider dispatcher.
+
+The projection is deliberately opt-in at the low-level executor constructor so
+legacy test/embedding callers retain byte-identical behavior. The real runner
+passes the resolved economics snapshot. A missing projection, unknown model,
+catalog/cost/backend mismatch, or any other failed pin produces a Kernel
+`blocked` result and returns before `execute_task`; it never falls back to the
+provider's default model. Resume requires enabled router and projection state to
+agree, then rebuilds the projection from the current catalog and default route
+identity rather than persisted metadata. A tampered resume payload therefore
+cannot authorize a new model, cost, persona, tool policy, authority, or
+capability set.

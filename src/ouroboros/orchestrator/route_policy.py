@@ -22,6 +22,10 @@ from typing import TYPE_CHECKING, NamedTuple, NoReturn
 import weakref
 
 from ouroboros.core.security import is_stable_authority_identity
+from ouroboros.orchestrator.contract_numbers import (
+    json_safe_nonnegative_int,
+    parse_nonnegative_contract_int,
+)
 
 ROUTE_CONTRACT_VERSION = 1
 MAX_ROUTE_ID_CHARS = 160
@@ -30,7 +34,6 @@ MAX_ROUTE_CAPABILITIES = 32
 MAX_ROUTE_CANDIDATES = 128
 MAX_ADVISOR_ORDER = 128
 MAX_REJECTION_REASONS = 16
-MAX_ROUTE_COST_UNITS = 1_000_000_000
 MAX_ROUTE_ORDINAL = 1_000_000_000
 
 _SAFE_ROUTE_ID = re.compile(rf"^[A-Za-z0-9][A-Za-z0-9._:/-]{{0,{MAX_ROUTE_ID_CHARS - 1}}}$")
@@ -83,7 +86,7 @@ class RouteCandidate:
 
     def __post_init__(self) -> None:
         route_id = _bounded_token(self.route_id, field="route_id", pattern=_SAFE_ROUTE_ID)
-        model = _bounded_token(self.model, field="model", pattern=_SAFE_TOKEN)
+        model = _model_value(self.model, field="model")
         harness = _bounded_token(self.harness, field="harness", pattern=_SAFE_TOKEN)
         effort = (
             None
@@ -100,8 +103,6 @@ class RouteCandidate:
             raise ValueError("cost_units must be an integer")
         if self.cost_units < 0:
             raise ValueError("cost_units must be >= 0")
-        if self.cost_units > MAX_ROUTE_COST_UNITS:
-            raise ValueError("cost_units exceeds its bound")
         if type(self.ordinal) is not int:
             raise ValueError("ordinal must be an integer")
         if self.ordinal < 0:
@@ -132,7 +133,7 @@ class RouteCandidate:
             "model": self.model,
             "harness": self.harness,
             "effort": self.effort,
-            "cost_units": self.cost_units,
+            "cost_units": json_safe_nonnegative_int(self.cost_units),
             "persona": self.persona,
             "tool_policy": self.tool_policy,
             "authority_identity": self.authority_identity,
@@ -168,12 +169,15 @@ class RouteCandidate:
             capabilities, str | bytes | bytearray
         ):
             raise ValueError("route candidate capabilities must be a list")
+        cost_units = parse_nonnegative_contract_int(value["cost_units"])
+        if cost_units is None:
+            raise ValueError("route candidate cost_units is invalid")
         return cls(
             route_id=value["route_id"],  # type: ignore[arg-type]
             model=value["model"],  # type: ignore[arg-type]
             harness=value["harness"],  # type: ignore[arg-type]
             effort=value["effort"],  # type: ignore[arg-type]
-            cost_units=value["cost_units"],  # type: ignore[arg-type]
+            cost_units=cost_units,
             persona=value["persona"],  # type: ignore[arg-type]
             tool_policy=value["tool_policy"],  # type: ignore[arg-type]
             authority_identity=value["authority_identity"],  # type: ignore[arg-type]
@@ -295,6 +299,8 @@ class RouteRequirements:
                 normalized = (
                     _bounded_identity(value, field=field_name)
                     if field_name == "pinned_authority_identity"
+                    else _model_value(value, field=field_name)
+                    if field_name == "pinned_model"
                     else _bounded_token(
                         value,
                         field=field_name,
@@ -857,7 +863,7 @@ def _bounded_token(value: object, *, field: str, pattern: re.Pattern[str]) -> st
         normalized = str.strip(str.__str__(value))
     except Exception as exc:
         raise ValueError(f"{field} has an invalid shape") from exc
-    if type(normalized) is not str:
+    if type(normalized) is not str or not normalized:
         raise ValueError(f"{field} has an invalid shape")
     if (
         not normalized
@@ -872,6 +878,20 @@ def _bounded_identity(value: object, *, field: str) -> str:
     normalized = _bounded_token(value, field=field, pattern=_SAFE_TOKEN)
     if not is_stable_authority_identity(normalized):
         raise ValueError(f"{field} must be a stable authority descriptor")
+    return normalized
+
+
+def _model_value(value: object, *, field: str) -> str:
+    """Copy an existing public ``ModelConfig.model`` value without narrowing it."""
+
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    try:
+        normalized = str.__str__(value)
+    except Exception as exc:
+        raise ValueError(f"{field} has an invalid shape") from exc
+    if type(normalized) is not str or not normalized:
+        raise ValueError(f"{field} has an invalid shape")
     return normalized
 
 
@@ -961,7 +981,6 @@ def _bounded_mapping_keys(
 
 __all__ = [
     "ROUTE_CONTRACT_VERSION",
-    "MAX_ROUTE_COST_UNITS",
     "MAX_ROUTE_CANDIDATES",
     "MAX_ROUTE_ORDINAL",
     "RouteAdmission",
