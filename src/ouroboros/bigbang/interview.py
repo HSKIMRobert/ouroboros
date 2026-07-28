@@ -634,7 +634,7 @@ class InterviewEngine:
         or passed directly to the constructor.
     """
 
-    llm_adapter: LLMAdapter
+    llm_adapter: LLMAdapter | None = None
     state_dir: Path = field(default_factory=lambda: Path.home() / ".ouroboros" / "data")
     model: str | None = None
     model_is_explicit: bool = field(default=False, init=False)
@@ -661,6 +661,23 @@ class InterviewEngine:
         if self.model is None:
             self.model = get_llm_model_for_role("interview")
         secure_directory(self.state_dir)
+
+    def _require_llm_adapter(self) -> LLMAdapter:
+        """Return the LLM adapter or raise a clear error.
+
+        Read-only methods (``list_interviews``, ``save_state``, …) do not need
+        an LLM adapter.  Methods that call the LLM (``ask_next_question``,
+        ``_generate_question_candidates``, …) must call this guard first so the
+        error message explains *which* method requires an adapter and why.
+        """
+        if self.llm_adapter is None:
+            raise RuntimeError(
+                "This InterviewEngine method requires an llm_adapter, but none "
+                "was provided. Pass llm_adapter=... when constructing "
+                "InterviewEngine, or use a read-only method such as "
+                "list_interviews() that does not need one."
+            )
+        return self.llm_adapter
 
     def _state_file_path(self, interview_id: str) -> Path:
         """Get the path to the state file for an interview.
@@ -844,7 +861,7 @@ class InterviewEngine:
             if candidate is not None:
                 return Result.ok(candidate)
 
-        result = await self.llm_adapter.complete(messages, config)
+        result = await self._require_llm_adapter().complete(messages, config)
 
         if result.is_err:
             log.warning(
@@ -931,7 +948,7 @@ class InterviewEngine:
                 *conversation_history,
             ]
             try:
-                result = await self.llm_adapter.complete(messages, config)
+                result = await self._require_llm_adapter().complete(messages, config)
             except Exception as exc:  # noqa: BLE001 - candidate is best-effort
                 log.warning(
                     "interview.question_candidate_failed",
