@@ -862,7 +862,7 @@ class OrchestratorRunner:
         mcp_tool_prefix: str = "",
         debug: bool = False,
         enable_decomposition: bool = True,
-        decomposition_mode: Literal["preflight", "bounce_only", "off"] | None = None,
+        decomposition_mode: Literal["bounce_only", "off"] | None = None,
         inherited_runtime_handle: RuntimeHandle | None = None,
         inherited_tools: list[str] | None = None,
         task_cwd: str | None = None,
@@ -892,6 +892,8 @@ class OrchestratorRunner:
             decomposition_mode: Optional decomposition mode override. When omitted,
                 the runner uses ``execution.decomposition_mode`` from config.
                 ``enable_decomposition=False`` forces the effective mode to ``off``.
+                Legacy config files are migrated while loading; direct preflight
+                overrides are rejected instead of authorizing a provider effect.
             inherited_runtime_handle: Optional parent Claude runtime handle for
                         delegated child executions that should fork a session.
             inherited_tools: Optional effective tool set inherited from a
@@ -1023,14 +1025,16 @@ class OrchestratorRunner:
         self._cross_harness_redispatch_enabled = get_cross_harness_redispatch_enabled()
         self._context_pack_enabled = get_context_pack_enabled()
         self._project_guidance_ids = tuple(_execution_config.project_guidance)
-        self._decomposition_mode: Literal["preflight", "bounce_only", "off"] = (
-            "off"
-            if not enable_decomposition
-            else (
-                _execution_config.decomposition_mode
-                if decomposition_mode is None
-                else decomposition_mode
-            )
+        configured_decomposition_mode = (
+            _execution_config.decomposition_mode
+            if decomposition_mode is None
+            else decomposition_mode
+        )
+        if configured_decomposition_mode not in {"bounce_only", "off"}:
+            msg = f"Unsupported decomposition_mode: {configured_decomposition_mode!r}"
+            raise ValueError(msg)
+        self._decomposition_mode: Literal["bounce_only", "off"] = (
+            "off" if not enable_decomposition else configured_decomposition_mode
         )
         if not _model_routing_disabled:
             from ouroboros.orchestrator.model_routing import build_model_router
@@ -3832,7 +3836,7 @@ class OrchestratorRunner:
             and 1 <= effective_workers <= max_workers
             and effective_workers == expected_effective_workers
             and isinstance(mode, str)
-            and mode in {"preflight", "bounce_only", "off"}
+            and mode in {"bounce_only", "off"}
             and (value.get("enable_decomposition") is True or mode == "off")
             and isinstance(backend, str)
             and bool(backend)
@@ -3841,6 +3845,25 @@ class OrchestratorRunner:
             and 1 <= usage_limit_pause_seconds <= MAX_USAGE_LIMIT_PAUSE_SECONDS
             and valid_runtime_effect_capabilities_contract(value.get("runtime_effect_capabilities"))
         )
+
+    @staticmethod
+    def _valid_legacy_preflight_execution_semantics_contract(value: object) -> bool:
+        """Recognize only the retired current-schema preflight snapshot.
+
+        The migration changes one authority bit (``preflight`` to
+        ``bounce_only``); every other effect-bearing field must already satisfy
+        the exact current schema.  This helper never feeds a live constructor.
+        """
+
+        if (
+            not isinstance(value, Mapping)
+            or value.get("decomposition_mode") != "preflight"
+            or value.get("enable_decomposition") is not True
+        ):
+            return False
+        migrated = dict(value)
+        migrated["decomposition_mode"] = "bounce_only"
+        return OrchestratorRunner._valid_execution_semantics_contract(migrated)
 
     def _execution_semantics_snapshot(
         self,
@@ -6028,6 +6051,33 @@ class OrchestratorRunner:
                 },
             )
 
+        migrate_preflight_contract = self._valid_legacy_preflight_execution_semantics_contract(
+            raw_execution_semantics
+        )
+        if migrate_preflight_contract:
+            persisted_legacy_fingerprint = raw_proof.get("execution_semantics_fingerprint")
+            if not isinstance(
+                persisted_legacy_fingerprint, str
+            ) or persisted_legacy_fingerprint != self._execution_semantics_fingerprint(
+                raw_execution_semantics
+            ):
+                raise OrchestratorError(
+                    message="Cannot resume with an invalid legacy preflight contract",
+                    details={"invalid": "execution_semantics_fingerprint"},
+                )
+            migrated_contract = deepcopy(dict(raw_contract))
+            migrated_semantics = migrated_contract["execution_semantics"]
+            migrated_proof = migrated_contract["frugality_proof"]
+            assert isinstance(migrated_semantics, dict)
+            assert isinstance(migrated_proof, dict)
+            migrated_semantics["decomposition_mode"] = "bounce_only"
+            migrated_proof["execution_semantics_fingerprint"] = (
+                self._execution_semantics_fingerprint(migrated_semantics)
+            )
+            raw_contract = migrated_contract
+            raw_proof = migrated_proof
+            raw_execution_semantics = migrated_semantics
+
         # Version 2 predates effort/Route B fields; version 3 predates the
         # independent requested-tier field; version 4 predates the complete
         # executor-semantics snapshot. Only those exact shapes migrate.
@@ -6488,6 +6538,9 @@ class OrchestratorRunner:
             if authority_generation is None:
                 replacement["foundation_a_authority"] = dict(raw_contract["foundation_a_authority"])
             self._execution_contract = replacement
+            return True
+        if migrate_preflight_contract:
+            self._execution_contract = dict(raw_contract)
             return True
         # Preserve the exact persisted proof identity alongside the restored
         # router. Recomputing it from a resumed throwaway worktree would make the

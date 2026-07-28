@@ -502,6 +502,7 @@ class TestExecutionEventEmitter:
         self,
     ) -> None:
         from ouroboros.orchestrator.decomposition_policy import (
+            BounceCause,
             DecompositionDecisionRecord,
             DecompositionDisposition,
             DecompositionSource,
@@ -510,29 +511,33 @@ class TestExecutionEventEmitter:
         from ouroboros.orchestrator.execution_runtime_scope import ExecutionNodeIdentity
 
         safe_emit = AsyncMock(return_value=True)
-        emitter = ExecutionEventEmitter(AsyncMock(), safe_emit_event=safe_emit)
+        event_store = AsyncMock()
+        emitter = ExecutionEventEmitter(event_store, safe_emit_event=safe_emit)
         node = ExecutionNodeIdentity.root(execution_context_id="exec_1", ac_index=0)
         decision = DecompositionDecisionRecord(
             node_id=node.node_id,
-            source=DecompositionSource.PREFLIGHT,
-            disposition=DecompositionDisposition.ATOMIC,
-            reasons=("small enough",),
+            source=DecompositionSource.BOUNCE,
+            disposition=DecompositionDisposition.ESCALATED,
+            cause=BounceCause.TOO_BIG,
+            reasons=("decomposition_depth_cap",),
+            compromise_reason="depth_cap_forced_atomic",
         )
 
         await emitter.emit_decomposition_decision_finalized(
             execution_id="exec_1",
             session_id="sess_1",
-            mode="preflight",
+            mode="bounce_only",
             node_identity=node,
             decision=decision,
         )
 
-        event = safe_emit.await_args.args[0]
+        event = event_store.append.await_args.args[0]
+        safe_emit.assert_not_awaited()
         assert event.type == "execution.decomposition.decision_finalized"
         assert event.aggregate_id == "exec_1"
         assert event.data["node_id"] == node.node_id
-        assert event.data["mode"] == "preflight"
-        assert event.data["disposition"] == "ATOMIC"
+        assert event.data["mode"] == "bounce_only"
+        assert event.data["disposition"] == "ESCALATED"
         assert event.data["child_count"] == 0
 
     @pytest.mark.asyncio
@@ -541,7 +546,8 @@ class TestExecutionEventEmitter:
         from ouroboros.orchestrator.execution_runtime_scope import ExecutionNodeIdentity
 
         safe_emit = AsyncMock(return_value=True)
-        emitter = ExecutionEventEmitter(AsyncMock(), safe_emit_event=safe_emit)
+        event_store = AsyncMock()
+        emitter = ExecutionEventEmitter(event_store, safe_emit_event=safe_emit)
         node = ExecutionNodeIdentity.root(execution_context_id="exec_1", ac_index=0)
 
         await emitter.emit_bounce_classified(
@@ -549,22 +555,23 @@ class TestExecutionEventEmitter:
             session_id="sess_1",
             node_identity=node,
             cause="TOO_BIG",
-            rationale="leaf exceeded scope",
-            failure_class="blocked",
-            retry_admission="redispatch",
-            evidence_refs=("event:1",),
-            trace_summary="bounded summary",
+            rationale="Attempt evidence shows distinct parent scope remains.",
+            failure_class="SCOPE_CREEP",
+            retry_admission="REDISPATCH",
+            evidence_refs=(),
+            trace_summary="attempted_tool_count=1\nremaining_artifact_count=1",
         )
 
-        event = safe_emit.await_args.args[0]
+        event = event_store.append.await_args.args[0]
+        safe_emit.assert_not_awaited()
         assert event.type == "execution.decomposition.bounce_classified"
         assert event.aggregate_id == "exec_1"
         assert event.data["node_id"] == node.node_id
         assert event.data["cause"] == "TOO_BIG"
-        assert event.data["failure_class"] == "blocked"
-        assert event.data["retry_admission"] == "redispatch"
-        assert event.data["evidence_refs"] == ["event:1"]
-        assert event.data["trace_summary"] == "bounded summary"
+        assert event.data["failure_class"] == "SCOPE_CREEP"
+        assert event.data["retry_admission"] == "REDISPATCH"
+        assert event.data["evidence_refs"] == []
+        assert event.data["trace_summary"] == ("attempted_tool_count=1\nremaining_artifact_count=1")
 
 
 class TestOrchestratorRunner:
@@ -647,8 +654,15 @@ class TestOrchestratorRunner:
             mock_event_store,
             mock_console,
             enable_decomposition=False,
-            decomposition_mode="preflight",
+            decomposition_mode="off",
         )
+        with pytest.raises(ValueError, match="Unsupported decomposition_mode"):
+            OrchestratorRunner(
+                mock_adapter,
+                mock_event_store,
+                mock_console,
+                decomposition_mode="preflight",  # type: ignore[arg-type]
+            )
 
         assert runner._decomposition_mode == "bounce_only"
         assert disabled_runner._decomposition_mode == "off"
@@ -6454,7 +6468,89 @@ class TestOrchestratorRunner:
         assert profile.profile == sample_seed.task_type == "code"
         assert profile.axis == "testable_unit"
         assert captured_init["fat_harness_mode"] is True
-        assert captured_init["decomposition_mode"] == "preflight"
+        assert captured_init["decomposition_mode"] == "bounce_only"
+
+    @pytest.mark.asyncio
+    async def test_legacy_preflight_resume_reaches_executor_as_bounce_only(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """An old durable run migrates before the resumed executor is built."""
+
+        from ouroboros.orchestrator.mcp_tools import assemble_session_tool_catalog
+
+        runner = OrchestratorRunner(mock_adapter, mock_event_store, mock_console)
+        legacy_contract = copy.deepcopy(runner._build_execution_contract(seed=sample_seed))
+        legacy_contract["execution_semantics"]["decomposition_mode"] = "preflight"
+        legacy_contract["frugality_proof"]["execution_semantics_fingerprint"] = (
+            runner._execution_semantics_fingerprint(legacy_contract["execution_semantics"])
+        )
+        changed, migrated_contract = runner._restore_execution_contract_snapshot(
+            {EXECUTION_CONTRACT_PROGRESS_KEY: legacy_contract},
+            seed=sample_seed,
+        )
+        assert changed is True
+
+        tracker = SessionTracker.create("exec_preflight_resume", sample_seed.metadata.seed_id)
+        dependency_graph = DependencyGraph(
+            nodes=(ACNode(index=0, content=sample_seed.acceptance_criteria[0]),),
+            execution_levels=((0,),),
+        )
+        parallel_result = ParallelExecutionResult(
+            results=(
+                ACExecutionResult(
+                    ac_index=0,
+                    ac_content=sample_seed.acceptance_criteria[0],
+                    success=True,
+                    final_message="done",
+                ),
+            ),
+            success_count=1,
+            failure_count=0,
+            total_messages=1,
+        )
+        captured_init: dict[str, Any] = {}
+
+        class _FakeParallelExecutor:
+            def __init__(self, **kwargs: Any) -> None:
+                captured_init.update(kwargs)
+
+            async def execute_parallel(self, **_kwargs: Any) -> ParallelExecutionResult:
+                return parallel_result
+
+        with (
+            patch(
+                "ouroboros.orchestrator.dependency_analyzer.DependencyAnalyzer.analyze",
+                AsyncMock(return_value=Result.ok(dependency_graph)),
+            ),
+            patch.object(runner, "_check_cancellation", AsyncMock(return_value=False)),
+            patch.object(
+                runner._session_repo,
+                "mark_completed",
+                AsyncMock(return_value=Result.ok(None)),
+            ),
+            patch(
+                "ouroboros.orchestrator.parallel_executor.ParallelACExecutor",
+                _FakeParallelExecutor,
+            ),
+        ):
+            result = await runner._execute_parallel(
+                seed=sample_seed,
+                exec_id=tracker.execution_id,
+                tracker=tracker,
+                merged_tools=["Read"],
+                tool_catalog=assemble_session_tool_catalog(["Read"]),
+                system_prompt="system",
+                start_time=tracker.start_time,
+                execution_contract=migrated_contract,
+            )
+
+        assert result.is_ok
+        assert captured_init["decomposition_mode"] == "bounce_only"
+        assert migrated_contract["execution_semantics"]["decomposition_mode"] == "bounce_only"
 
     @pytest.mark.asyncio
     async def test_execute_parallel_passes_fat_harness_mode_to_executor(
@@ -7727,6 +7823,7 @@ class TestOrchestratorRunnerWithMCP:
         store = AsyncMock()
         store.append = AsyncMock()
         store.replay = AsyncMock(return_value=[])
+        store.query_execution_related_events = AsyncMock(return_value=[])
         return store
 
     @pytest.fixture
