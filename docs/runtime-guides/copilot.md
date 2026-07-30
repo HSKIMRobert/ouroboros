@@ -171,9 +171,10 @@ install method the wizard detected:
 }
 ```
 
-Pipx and direct binary installs are written as `command: ouroboros` with
-matching args. The wizard is idempotent and will rewrite the entry on
-re-runs to match your current install method.
+When `uvx` is unavailable, setup uses `pipx run --spec ouroboros-ai[mcp]`.
+It never registers a direct global binary or `python -m` fallback because
+those environments cannot guarantee MCP 2. The wizard is idempotent and
+updates setup-managed entries to the current isolated launcher.
 
 > **Restart required**: Copilot CLI binds MCP children at session start.
 > After the first registration (or any change to the entry), close and
@@ -206,9 +207,9 @@ Install Copilot CLI per the GitHub docs, then either let setup auto-detect
 it or set `OUROBOROS_COPILOT_CLI_PATH=/abs/path/to/copilot`.
 
 **`MCP dependencies not installed: mcp package not installed.`**
-Ouroboros was installed without the `[mcp]` extra. Reinstall with one of:
-`pipx install 'ouroboros-ai[mcp]'`, `uv tool install 'ouroboros-ai[mcp]'`,
-or `pip install 'ouroboros-ai[mcp]'`. For local dev installs use
+The isolated MCP launcher is unavailable or could not load the `[mcp]` extra.
+Install with `pipx install 'ouroboros-ai[mcp]'` or
+`uv tool install 'ouroboros-ai[mcp]'`. For local dev installs use
 `uv tool install --with mcp --from . ouroboros-ai`.
 
 **`ouroboros-ouroboros_*` tools return `Error: Not connected`.**
