@@ -24,11 +24,14 @@ key to manage.
 | `copilot` CLI    | Provider — install per the [Copilot CLI install guide](https://docs.github.com/copilot/concepts/agents/about-copilot-cli) |
 | `gh` CLI         | Used to discover the live Copilot model catalog (`gh auth token`)  |
 | GitHub auth      | `gh auth login` once before first use                              |
-| Ouroboros (mcp)  | `pipx install 'ouroboros-ai[mcp]'` (or `uv tool install` / `pip install`) |
+| Ouroboros (mcp)  | `pipx install 'ouroboros-ai[mcp]'` or `uv tool install 'ouroboros-ai[mcp]'` |
 
 > Copilot runs on the **base** Ouroboros package plus the `[mcp]` extra. It
 > does not require the `[claude]` extra; the MCP entry is registered with
-> `ouroboros-ai[mcp]`.
+> `ouroboros-ai[mcp]`. Host registration requires the package-isolated `uvx`
+> or `pipx run` launcher. A plain `pip install` is suitable for embedding in
+> an already isolated environment, but it does not satisfy this host-launcher
+> requirement by itself; setup fails closed if neither launcher is available.
 
 ## Quick start
 
@@ -171,7 +174,15 @@ install method the wizard detected:
 }
 ```
 
-When `uvx` is unavailable, setup uses `pipx run --spec ouroboros-ai[mcp]`.
+When `uvx` is unavailable, setup writes the equivalent `pipx` entry:
+
+```json
+{
+  "command": "pipx",
+  "args": ["run", "--spec", "ouroboros-ai[mcp]", "ouroboros", "mcp", "serve"]
+}
+```
+
 It never registers a direct global binary or `python -m` fallback because
 those environments cannot guarantee MCP 2. The wizard is idempotent and
 updates setup-managed entries to the current isolated launcher.

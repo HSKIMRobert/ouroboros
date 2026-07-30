@@ -192,6 +192,59 @@ def test_shipped_mcp_launchers_use_the_isolated_mcp_profile() -> None:
         assert entry["args"] == expected_args
 
 
+def test_runtime_guides_require_isolated_mcp_host_launchers() -> None:
+    """Host guides must match setup's fail-closed uvx/pipx contract."""
+    root = Path(__file__).parent.parent.parent
+    guides = {
+        runtime: (root / "docs" / "runtime-guides" / f"{runtime}.md").read_text(encoding="utf-8")
+        for runtime in ("kiro", "copilot", "hermes")
+    }
+
+    exact_launcher_contracts = {
+        "kiro": (
+            '"command": "uvx"',
+            '"args": ["--from", "ouroboros-ai[mcp]", "ouroboros", "mcp", "serve"]',
+            '"command": "pipx"',
+            '"args": ["run", "--spec", "ouroboros-ai[mcp]", "ouroboros", "mcp", "serve"]',
+        ),
+        "copilot": (
+            '"command": "uvx"',
+            '"args": ["--from", "ouroboros-ai[mcp]", "ouroboros", "mcp", "serve"]',
+            '"command": "pipx"',
+            '"args": ["run", "--spec", "ouroboros-ai[mcp]", "ouroboros", "mcp", "serve"]',
+        ),
+        "hermes": (
+            "command: uvx",
+            'args: [--from, "ouroboros-ai[mcp]", ouroboros, mcp, serve]',
+            "command: pipx",
+            'args: [run, --spec, "ouroboros-ai[mcp]", ouroboros, mcp, serve]',
+        ),
+    }
+    forbidden_host_commands = (
+        '"command": "/path/to/ouroboros"',
+        '"command": "ouroboros"',
+        '"command": "python"',
+        '"command": "python3"',
+        "command: ouroboros",
+        "command: python",
+        "command: python3",
+    )
+
+    for runtime, content in guides.items():
+        assert "pipx install 'ouroboros-ai[mcp]'" in content
+        assert "uv tool install 'ouroboros-ai[mcp]'" in content
+        for snippet in exact_launcher_contracts[runtime]:
+            assert snippet in content
+        for forbidden in forbidden_host_commands:
+            assert forbidden not in content
+
+    assert "from the venv that owns" not in guides["kiro"]
+    assert "`uv tool install` / `pip install`" not in guides["copilot"]
+    assert "plain `pip install`" in guides["copilot"]
+    assert "setup fails closed" in guides["copilot"]
+    assert "never falls back to a direct `ouroboros` binary" in guides["hermes"]
+
+
 @pytest.mark.parametrize(
     "skill_path",
     [
