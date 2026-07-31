@@ -59,8 +59,11 @@ from ouroboros.core.project_identity import (
     ProjectIdentity,
     ProjectIdentityError,
     ProjectIdentityUnavailableError,
+    active_publication_evidence_sink,
+    publication_evidence_sink,
     resolve_managed_project_identity,
     resolve_project_identity,
+    resolve_project_identity_for_publication,
 )
 from ouroboros.core.seed import AcceptanceCriterionSpec, ac_text, ac_texts
 from ouroboros.core.seed_contract import SeedContract
@@ -3317,7 +3320,10 @@ class OrchestratorRunner:
             effective_cwd = self._effective_cwd()
             if not isinstance(effective_cwd, str) or not effective_cwd.strip():
                 return None
-            return resolve_project_identity(effective_cwd)
+            if active_publication_evidence_sink() is None:
+                return resolve_project_identity(effective_cwd)
+            identity, _evidence = resolve_project_identity_for_publication(effective_cwd)
+            return identity
         except ProjectIdentityError as exc:
             raise self._project_identity_error(exc) from exc
 
@@ -8521,7 +8527,23 @@ class OrchestratorRunner:
 
         This allows callers such as MCP handlers to return stable tracking IDs
         immediately and then start the actual runtime work asynchronously.
+
+        Contract construction captures the resolver's repo-local input
+        closure, and the publication boundary revalidates from that evidence
+        by metadata alone when nothing observable changed — escalating to the
+        full re-resolution (probe included) otherwise (#1796 L2).
         """
+        with publication_evidence_sink():
+            return await self._prepare_session_scoped(
+                seed, execution_id=execution_id, session_id=session_id
+            )
+
+    async def _prepare_session_scoped(
+        self,
+        seed: Seed,
+        execution_id: str | None = None,
+        session_id: str | None = None,
+    ) -> Result[SessionTracker, OrchestratorError]:
         exec_id = execution_id or f"exec_{uuid4().hex[:12]}"
         resolved_session_id = session_id or f"orch_{uuid4().hex[:12]}"
         self._execution_guidance = None
