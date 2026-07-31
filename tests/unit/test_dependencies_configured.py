@@ -266,9 +266,9 @@ def test_claude_skills_never_recommend_combined_mcp_profile(skill_path: str) -> 
     assert "ouroboros-ai[claude,mcp]" not in content
 
 
-@pytest.mark.parametrize("skill_name", ["setup", "update", "welcome", "pm", "unstuck"])
+@pytest.mark.parametrize("skill_name", ["update", "pm", "unstuck"])
 def test_claude_plugin_skill_mirrors_canonical_skill(skill_name: str) -> None:
-    """The marketplace mirror must ship the same runtime contract as source."""
+    """Host-agnostic marketplace skills must mirror their canonical source."""
     root = Path(__file__).parent.parent.parent
     canonical = (root / "skills" / skill_name / "SKILL.md").read_text(encoding="utf-8")
     plugin = (root / ".claude-plugin" / "skills" / skill_name / "SKILL.md").read_text(
