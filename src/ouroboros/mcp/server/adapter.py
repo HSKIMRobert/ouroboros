@@ -1647,6 +1647,7 @@ def create_ouroboros_server(
         LineageStatusHandler,
         MeasureDriftHandler,
         ProjectionQueryHandler,
+        ProjectStatusHandler,
         QueryEventsHandler,
         RalphHandler,
         SessionStatusHandler,
@@ -2359,9 +2360,7 @@ def create_ouroboros_server(
             mcp_tool_prefix=auto_mcp_prefix,
             ralph_handler_factory=build_ralph_handler,
         ),
-        SessionStatusHandler(
-            event_store=event_store,
-        ),
+        SessionStatusHandler(event_store=event_store),
         RecordConductorDecisionHandler(event_store=event_store),
         SynapseTargetsHandler(session_signal_target_resolver),
         synapse_signal,
@@ -2383,11 +2382,11 @@ def create_ouroboros_server(
             event_store=event_store,
             job_manager=job_manager,
         ),
-        QueryEventsHandler(
+        QueryEventsHandler(event_store=event_store),
+        ProjectionQueryHandler(event_store=event_store),
+        ProjectStatusHandler(
             event_store=event_store,
-        ),
-        ProjectionQueryHandler(
-            event_store=event_store,
+            default_project_dir=effective_cwd,
         ),
         GenerateSeedHandler(
             interview_engine=interview_engine,
