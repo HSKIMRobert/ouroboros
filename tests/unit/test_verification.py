@@ -1559,6 +1559,19 @@ class TestSpecVerifier:
 
 # -- Extractor Tests --
 
+_GOOD_EXTRACTION = json.dumps(
+    [
+        {
+            "ac_index": 0,
+            "tier": "t2_structural",
+            "pattern": "class Foo",
+            "expected_value": "",
+            "file_hint": "*.py",
+            "description": "",
+        }
+    ]
+)
+
 
 class TestAssertionExtractor:
     """Tests for LLM-based assertion extraction."""
@@ -1578,6 +1591,21 @@ class TestAssertionExtractor:
                     usage={"input": 0, "output": 0},
                 )
             )
+        )
+        return AssertionExtractor(llm_adapter=mock_adapter)
+
+    def _make_extractor_sequence(self, *contents: str) -> AssertionExtractor:
+        """Create extractor whose mocked LLM answers each call in turn."""
+        mock_adapter = AsyncMock()
+        mock_adapter.complete = AsyncMock(
+            side_effect=[
+                Result.ok(
+                    CompletionResponse(
+                        content=content, model="test", usage={"input": 0, "output": 0}
+                    )
+                )
+                for content in contents
+            ]
         )
         return AssertionExtractor(llm_adapter=mock_adapter)
 
@@ -1743,6 +1771,138 @@ class TestAssertionExtractor:
         assert r1.is_ok and r2.is_ok
         assert r1.value is r2.value
         # LLM called only once
+        extractor.llm_adapter.complete.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unreadable",
+        [
+            "Sorry, I cannot help with that.",
+            "[{",
+            '{"assertions": []}',
+            "",
+        ],
+        ids=["prose", "malformed-json", "object-instead-of-array", "nothing-at-all"],
+    )
+    async def test_an_unreadable_response_is_not_remembered_as_an_extraction(
+        self, unreadable: str
+    ) -> None:
+        """A reply nobody could read must not answer every later generation.
+
+        The cache exists so a seed is extracted once. But the empty tuple a
+        failed parse returns is indistinguishable, to the caller, from "nothing
+        here needs verifying" — it makes `_verify_spec_compliance` return None
+        and the evaluator fall back to the agent's own self-report. Cached, that
+        single unreadable reply silently disables spec verification for every
+        later generation of the seed, and the log even calls it a cache hit.
+
+        The transport-failure path above is already retried on the next
+        generation. Only this path was permanent.
+        """
+        extractor = self._make_extractor_sequence(unreadable, _GOOD_EXTRACTION, _GOOD_EXTRACTION)
+
+        first = await extractor.extract("seed_unreadable", ("Has class Foo",))
+        assert first.is_ok
+        assert first.value == ()
+
+        second = await extractor.extract("seed_unreadable", ("Has class Foo",))
+        assert second.is_ok
+        assert len(second.value) == 1, "the next generation must be allowed to ask again"
+
+        third = await extractor.extract("seed_unreadable", ("Has class Foo",))
+        assert third.value is second.value, "the reply that was read is remembered"
+        assert extractor.llm_adapter.complete.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "wrong_schema",
+        [
+            json.dumps([{"ac_index": 0}]),
+            json.dumps([{"ac_index": 0, "tier": "t9_imaginary", "pattern": "class Foo"}]),
+            json.dumps([{"ac_index": 7, "tier": "t2_structural", "pattern": "class Foo"}]),
+            json.dumps(["just a string"]),
+            json.dumps([{"ac_index": 0, "tier": "t2_structural", "pattern": ""}]),
+        ],
+        ids=[
+            "no-tier",
+            "tier-that-does-not-exist",
+            "ac_index-past-the-end",
+            "item-that-is-not-an-object",
+            "structural-assertion-with-no-pattern",
+        ],
+    )
+    async def test_an_array_whose_every_entry_is_rejected_is_not_remembered(
+        self, wrong_schema: str
+    ) -> None:
+        """An array the model filled with the wrong shape was never read either.
+
+        The JSON parses and the outer array is right, so the old code walked it,
+        threw every entry away, and returned the same empty tuple an honest
+        "nothing to verify" returns — then cached it. The seed is then answered
+        forever from a reply in which nothing arrived in the schema this asks
+        for, which is the same permanent silence as unreadable prose.
+        """
+        extractor = self._make_extractor_sequence(wrong_schema, _GOOD_EXTRACTION, _GOOD_EXTRACTION)
+
+        first = await extractor.extract("seed_wrong_schema", ("Has class Foo",))
+        assert first.is_ok
+        assert first.value == ()
+
+        second = await extractor.extract("seed_wrong_schema", ("Has class Foo",))
+        assert second.is_ok
+        assert len(second.value) == 1, "a wrong-schema reply must stay retryable"
+
+        third = await extractor.extract("seed_wrong_schema", ("Has class Foo",))
+        assert third.value is second.value
+        assert extractor.llm_adapter.complete.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_an_array_only_partly_rejected_is_remembered_as_what_survived(self) -> None:
+        """One good entry among bad ones is still an extraction that was read.
+
+        The rule is about a reply in which *nothing* arrived, not about every
+        entry being perfect. If one assertion survives, the model answered in
+        this schema and the seed should not pay for a second extraction.
+        """
+        extractor = self._make_extractor_sequence(
+            json.dumps(
+                [
+                    {"ac_index": 0},
+                    {
+                        "ac_index": 0,
+                        "tier": "t2_structural",
+                        "pattern": "class Foo",
+                        "expected_value": "",
+                        "file_hint": "*.py",
+                        "description": "",
+                    },
+                    {"ac_index": 99, "tier": "t2_structural", "pattern": "class Bar"},
+                ]
+            )
+        )
+
+        first = await extractor.extract("seed_partly_rejected", ("Has class Foo",))
+        second = await extractor.extract("seed_partly_rejected", ("Has class Foo",))
+
+        assert first.is_ok and len(first.value) == 1
+        assert second.value is first.value
+        extractor.llm_adapter.complete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_readable_empty_extraction_is_still_remembered(self) -> None:
+        """An empty array is an answer — the model read the ACs and found nothing.
+
+        This is the boundary of the rule above: only a response that could not
+        be read is retried. Otherwise a seed whose criteria are genuinely not
+        machine-verifiable would pay for an extraction on every generation.
+        """
+        extractor = self._make_extractor([])
+
+        first = await extractor.extract("seed_nothing_verifiable", ("Looks nice",))
+        second = await extractor.extract("seed_nothing_verifiable", ("Looks nice",))
+
+        assert first.is_ok and second.is_ok
+        assert first.value == () and second.value == ()
         extractor.llm_adapter.complete.assert_called_once()
 
     @pytest.mark.asyncio
